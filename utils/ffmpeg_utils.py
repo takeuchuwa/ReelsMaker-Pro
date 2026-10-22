@@ -8,7 +8,9 @@ import shlex
 import shutil
 import re
 import tempfile
+import threading
 import uuid
+from collections import deque
 from typing import List, Optional, Tuple, Dict, Callable
 import logging
 
@@ -18,6 +20,7 @@ from .constants import (
     PRESETS_DIR, VIDEO_EXTENSIONS
 )
 from .path_utils import resource_path
+from .srt_shift import shift_srt_to_temp
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +46,55 @@ FFPROBE_PATH_BASE = FFMPEG_PATH_BASE.replace("ffmpeg.exe", "ffprobe.exe")
 FFMPEG_PATH_EFFECTIVE = find_executable(FFMPEG_PATH_BASE, "ffmpeg")
 FFPROBE_PATH_EFFECTIVE = find_executable(FFPROBE_PATH_BASE, "ffprobe")
 
+# Запущенные ffmpeg: при параллельной обработке остановка должна снимать все
+# сразу, а не ждать, пока каждый дойдёт до конца своего файла.
+_active_processes = set()
+_active_lock = threading.Lock()
+
+
+def terminate_all_ffmpeg():
+    with _active_lock:
+        processes = list(_active_processes)
+    for process in processes:
+        try:
+            process.terminate()
+        except Exception:
+            pass
+
+
+def is_vaapi(codec: str) -> bool:
+    return codec.endswith("_vaapi")
+
+
+_vaapi_device_cache = []
+
+
+def vaapi_device() -> Optional[str]:
+    """Узел рендеринга самой мощной видеокарты для VAAPI.
+
+    Если карт несколько (дискретная и встроенная в процессор), порядок
+    renderD128/129 не гарантирован, поэтому выбираем по объёму видеопамяти.
+    """
+    if _vaapi_device_cache:
+        return _vaapi_device_cache[0]
+    best, best_vram = None, -1
+    try:
+        nodes = sorted(n for n in os.listdir("/dev/dri") if n.startswith("renderD"))
+    except OSError:
+        nodes = []
+    for node in nodes:
+        vram = 0
+        try:
+            with open(f"/sys/class/drm/{node}/device/mem_info_vram_total") as f:
+                vram = int(f.read().strip())
+        except (OSError, ValueError):
+            pass
+        if vram > best_vram:
+            best, best_vram = f"/dev/dri/{node}", vram
+    _vaapi_device_cache.append(best)
+    logger.info(f"VAAPI device: {best}")
+    return best
+
 
 def run_ffmpeg(cmd: List[str], input_file_for_log: str = "input", duration: float = 0,
                progress_callback: Optional[Callable[[int], None]] = None):
@@ -59,8 +111,10 @@ def run_ffmpeg(cmd: List[str], input_file_for_log: str = "input", duration: floa
 
     final_cmd = [FFMPEG_PATH_EFFECTIVE]
 
+    # debug выдавал по строке на каждый пакет: при нескольких файлах сразу это
+    # заметная нагрузка, а для сообщения об ошибке хватает обычного уровня.
     if "-loglevel" not in cmd:
-        final_cmd.extend(["-loglevel", "debug"])
+        final_cmd.extend(["-loglevel", "info"])
     if progress_callback:
         final_cmd.extend(["-progress", "pipe:1"])
     if "-hide_banner" not in cmd:
@@ -77,7 +131,9 @@ def run_ffmpeg(cmd: List[str], input_file_for_log: str = "input", duration: floa
             creationflags=creationflags, startupinfo=startupinfo, bufsize=1,
             cwd=process_cwd
         )
-        output_lines = []
+        with _active_lock:
+            _active_processes.add(process)
+        output_lines = deque(maxlen=300)
         time_regex = re.compile(r"out_time_ms=(\d+)")
         while True:
             line = process.stdout.readline()
@@ -94,11 +150,13 @@ def run_ffmpeg(cmd: List[str], input_file_for_log: str = "input", duration: floa
                         progress_callback(min(progress, 100))
         process.stdout.close()
         return_code = process.wait()
+        with _active_lock:
+            _active_processes.discard(process)
         if return_code != 0:
             error_message = (
                     f"FFmpeg failed with exit code {return_code} for file '{os.path.basename(input_file_for_log)}'.\n"
                     f"Command: {command_for_log}\n"
-                    "Last lines of output:\n" + "\n".join(output_lines[-15:]))
+                    "Last lines of output:\n" + "\n".join(list(output_lines)[-15:]))
             raise subprocess.CalledProcessError(return_code, final_cmd, output="\n".join(output_lines),
                                                 stderr="\n".join(output_lines))
         logging.info(f"FFmpeg successfully processed '{os.path.basename(input_file_for_log)}'")
@@ -253,11 +311,16 @@ def probe_encoder(codec: str, timeout: int = 20) -> bool:
     """
     if not FFMPEG_PATH_EFFECTIVE:
         return False
-    cmd = [
-        FFMPEG_PATH_EFFECTIVE, "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", "color=black:s=256x256:d=0.1",
-        "-frames:v", "1", "-c:v", codec, "-f", "null", "-",
-    ]
+    cmd = [FFMPEG_PATH_EFFECTIVE, "-hide_banner", "-loglevel", "error"]
+    if is_vaapi(codec):
+        device = vaapi_device()
+        if not device:
+            return False
+        cmd.extend(["-vaapi_device", device])
+    cmd.extend(["-f", "lavfi", "-i", "color=black:s=256x256:d=0.1"])
+    if is_vaapi(codec):
+        cmd.extend(["-vf", "format=nv12,hwupload"])
+    cmd.extend(["-frames:v", "1", "-c:v", codec, "-f", "null", "-"])
     try:
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         result = subprocess.run(
@@ -370,6 +433,30 @@ def build_uniquify_plan(in_path: str, methods: Optional[Dict] = None) -> Dict:
     }
 
 
+def plan_input_window(source: float, trim_start: float, trim_end: Optional[float],
+                      unique: Optional[Dict]) -> Tuple[float, Optional[float]]:
+    """Какой кусок исходника читать: (начало, длительность или None до конца).
+
+    Ручные тайм-коды задают отрезок, случайный срез уникализации отнимается
+    уже от него. Если отрезок слишком короток, случайный срез пропускаем:
+    он не должен съедать то, что человек выбрал сам.
+    """
+    start = max(0.0, trim_start or 0.0)
+    if source > 0:
+        start = min(start, max(0.0, source - 0.1))
+    end = trim_end if trim_end and trim_end > start else (source if source > 0 else None)
+    if source > 0 and end is not None:
+        end = min(end, source)
+    head = unique['head'] if unique else 0.0
+    tail = unique['tail'] if unique else 0.0
+    if end is None:
+        return start + head, None
+    if end - start - head - tail > 1.0:
+        start += head
+        end -= tail
+    return start, end - start
+
+
 def process_single(
         in_path: str,
         out_path: str,
@@ -395,21 +482,36 @@ def process_single(
         uniquify: bool = False,
         uniquify_methods: Optional[Dict] = None,
         progress_callback: Optional[Callable[[int], None]] = None,
+        trim_start: float = 0.0,
+        trim_end: Optional[float] = None,
+        srt_origin: float = 0.0,
 ):
+    """srt_origin — с какой секунды исходника отсчитаны субтитры: 0 для файла
+    SRT и начало отрезка для распознанных по вырезанному звуку."""
     is_gif_input = in_path.lower().endswith('.gif')
     # Значения разыгрываются на каждый файл заново. Постоянный набор правок
     # сам становится приметой: по ней вычисляли партии роликов из телеграм-ботов.
     unique = build_uniquify_plan(in_path, uniquify_methods) if uniquify else None
     is_gif_overlay = overlay_file and overlay_file.lower().endswith('.gif')
     cmd = []
+    if is_vaapi(codec):
+        # Глобальная опция: должна стоять до первого -i.
+        cmd.extend(["-vaapi_device", vaapi_device() or "/dev/dri/renderD128"])
     input_streams = []
+    source_duration = 0.0 if is_gif_input else get_video_duration(in_path)
+    seek, keep = 0.0, None
     if is_gif_input:
         cmd.extend(["-stream_loop", "-1", "-i", in_path])
         input_streams.append({"type": "video", "index": 0, "path": in_path})
         has_real_audio = False
     else:
-        if unique and unique['head'] > 0:
-            cmd.extend(["-ss", f"{unique['head']:.3f}"])
+        # -ss и -t перед -i: ffmpeg сразу прыгает к нужному месту и читает
+        # только отрезок, а не декодирует весь файл и выбрасывает лишнее.
+        seek, keep = plan_input_window(source_duration, trim_start, trim_end, unique)
+        if seek > 0:
+            cmd.extend(["-ss", f"{seek:.3f}"])
+        if keep:
+            cmd.extend(["-t", f"{keep:.3f}"])
         cmd.extend(["-i", in_path])
         input_streams.append({"type": "video+audio", "index": 0, "path": in_path})
         has_real_audio = True
@@ -522,6 +624,11 @@ def process_single(
                 f"{last_video_node}scale=iw*{zoom_factor}:ih*{zoom_factor}:flags=bicubic{scale_node}")
             last_video_node = scale_node
 
+    shifted_srt = None
+    if srt_path and subtitle_style and abs(seek - srt_origin) > 0.0005:
+        shifted_srt = shift_srt_to_temp(srt_path, seek - srt_origin)
+        srt_path = shifted_srt
+
     if srt_path and subtitle_style:
         sanitized_srt_path = srt_path.replace('\\', '/').replace(':', '\\:')
         font_size = subtitle_style.get("font_size", 36)
@@ -600,7 +707,10 @@ def process_single(
         filter_complex_parts.append(f"{overlay_stream_label}format=rgba{alpha_node}")
         filter_complex_parts.append(f"{last_video_node}{alpha_node}overlay={pos_params}{overlay_node}")
         last_video_node = overlay_node
-    filter_complex_parts.append(f"{last_video_node}format=pix_fmts=yuv420p[vout]")
+    if is_vaapi(codec):
+        filter_complex_parts.append(f"{last_video_node}format=nv12,hwupload[vout]")
+    else:
+        filter_complex_parts.append(f"{last_video_node}format=pix_fmts=yuv420p[vout]")
     if final_audio_node and unique and abs(unique['pitch'] - 1.0) > 1e-6:
         # Сдвиг тона — единственный приём из отобранных, про который в
         # исследованиях прямо сказано, что отпечаток звука его не переносит.
@@ -626,18 +736,14 @@ def process_single(
         cmd.extend(["-cq", str(quality)])
     elif "qsv" in codec:
         cmd.extend(["-global_quality", str(quality)])
+    elif is_vaapi(codec):
+        cmd.extend(["-rc_mode", "CQP", "-qp", str(quality)])
     else:
         cmd.extend(["-preset", "veryfast", "-crf", str(quality)])
     if unique:
         # Размер группы кадров меняет структуру потока, а не картинку.
         if unique['gop']:
             cmd.extend(["-g", str(unique['gop'])])
-        if unique['tail'] > 0:
-            source = get_video_duration(in_path)
-            if source > 0:
-                keep = source - unique['head'] - unique['tail']
-                if keep > 1.0:
-                    cmd.extend(["-t", f"{keep:.3f}"])
     if strip_metadata: cmd.extend(["-map_metadata", "-1", "-map_chapters", "-1"])
     # Залипалка подаётся с -stream_loop -1, поэтому без -shortest рендер не
     # закончится никогда: длину должно задавать основное видео.
@@ -645,8 +751,15 @@ def process_single(
         cmd.append("-shortest")
     final_cmd = ["-y"] + cmd
     final_cmd.append(out_path)
-    duration = get_video_duration(in_path)
-    run_ffmpeg(final_cmd, input_file_for_log=in_path, duration=duration, progress_callback=progress_callback)
+    # Прогресс считается по времени результата: это вырезанный отрезок,
+    # растянутый или сжатый изменением скорости.
+    duration = (keep if keep else max(0.0, source_duration - seek)) / (speed_factor or 1.0)
+    try:
+        run_ffmpeg(final_cmd, input_file_for_log=in_path, duration=duration,
+                   progress_callback=progress_callback)
+    finally:
+        if shifted_srt and os.path.exists(shifted_srt):
+            os.remove(shifted_srt)
 
 
 def generate_preview(
@@ -661,11 +774,15 @@ def generate_preview(
         crop_filter: Optional[str] = None,
         filler_path: Optional[str] = None,
         split_content_height: int = 1080,
-        content_on_top: bool = True
+        content_on_top: bool = True,
+        at_time: Optional[float] = None,
 ):
     is_gif_input = in_path.lower().endswith('.gif')
-    duration = get_video_duration(in_path)
-    mid_point = duration / 2 if duration > 0 and not is_gif_input else 0
+    if at_time is not None:
+        mid_point = 0 if is_gif_input else max(0.0, at_time)
+    else:
+        duration = get_video_duration(in_path)
+        mid_point = duration / 2 if duration > 0 and not is_gif_input else 0
     cmd = ["-y"]
     if not is_gif_input:
         cmd.extend(["-ss", str(mid_point)])

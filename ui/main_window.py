@@ -31,6 +31,12 @@ from utils.ffmpeg_utils import (generate_preview, get_video_duration, detect_cro
 from utils.path_utils import resource_path
 from utils import links
 from ui.subtitle_preview_dialog import SubtitlePreviewDialog
+from ui.player import PlayerPanel
+from utils.timecode import format_timecode
+
+# Отрезок видео в элементе списка: (начало, конец или None) либо None — весь ролик.
+TRIM_ROLE = Qt.UserRole + 1
+HARDWARE_H264 = ('h264_vaapi', 'h264_nvenc', 'h264_qsv', 'h264_amf')
 
 
 class CodecProbeWorker(QThread):
@@ -213,7 +219,7 @@ class ProcessingWidgetContent(QWidget):
 
         main_splitter.addWidget(left_widget)
         main_splitter.addWidget(right_widget)
-        main_splitter.setSizes([350, 750])
+        main_splitter.setSizes([720, 640])
 
         # Add buttons
         add_buttons_layout = QHBoxLayout()
@@ -228,12 +234,27 @@ class ProcessingWidgetContent(QWidget):
         # Video list
         self.video_list_widget = DropListWidget(parent=self)
         self.video_list_widget.customContextMenuRequested.connect(self.on_list_menu)
-        self.left_panel.addWidget(self.video_list_widget)
 
         dnd_label = QLabel("Перетащите файлы или папки сюда")
         dnd_label.setObjectName("dnd_label")
         dnd_label.setAlignment(Qt.AlignCenter)
-        self.left_panel.addWidget(dnd_label)
+
+        list_box = QWidget()
+        list_layout = QVBoxLayout(list_box)
+        list_layout.setContentsMargins(0, 0, 0, 0)
+        list_layout.setSpacing(8)
+        list_layout.addWidget(self.video_list_widget)
+        list_layout.addWidget(dnd_label)
+
+        # Плеер с таймлайном под списком: выбранное в списке видео сразу
+        # открывается, и отрезок для него задаётся здесь же.
+        self.player_panel = PlayerPanel(self)
+        left_splitter = QSplitter(Qt.Vertical)
+        left_splitter.setChildrenCollapsible(False)
+        left_splitter.addWidget(list_box)
+        left_splitter.addWidget(self.player_panel)
+        left_splitter.setSizes([240, 560])
+        self.left_panel.addWidget(left_splitter, 1)
 
         # Tabs
         tab_widget = QTabWidget()
@@ -305,11 +326,31 @@ class ProcessingWidgetContent(QWidget):
         ofg_layout.addWidget(self.blur_background_checkbox)
         ofg_layout.addWidget(QLabel("Видеокодек:"))
         self.codec_combo = QComboBox()
+        on_linux = sys.platform.startswith('linux')
         for label, codec_value in CODECS.items():
+            # AMF есть только в Windows, VAAPI — только в Linux: чужие пункты
+            # лишь путали бы, показывая «нет поддержки» на рабочей видеокарте.
+            if (on_linux and '_amf' in codec_value) or (not on_linux and codec_value.endswith('_vaapi')):
+                continue
             # Значение храним в данных пункта: подпись меняется после проверки.
             self.codec_combo.addItem(label, codec_value)
         self.codec_combo.setToolTip("Проверка доступных кодеков...")
         ofg_layout.addWidget(self.codec_combo)
+
+        parallel_row = QHBoxLayout()
+        parallel_row.addWidget(QLabel("Одновременно файлов:"))
+        self.parallel_spin = QSpinBox()
+        self.parallel_spin.setRange(1, 8)
+        self.parallel_spin.setValue(3)
+        self.parallel_spin.setFixedWidth(70)
+        self.parallel_spin.setToolTip(
+            "Сколько видео обрабатывать одновременно.\n\n"
+            "Фильтры (размытие фона, субтитры) считаются на процессоре даже при "
+            "кодировании на видеокарте, поэтому несколько файлов сразу заметно "
+            "ускоряют партию. Распознавание речи всё равно идёт по одному.")
+        parallel_row.addWidget(self.parallel_spin)
+        parallel_row.addStretch()
+        ofg_layout.addLayout(parallel_row)
 
         # Какие кодировщики реально работают, выясняем в фоне: каждая проверка
         # запускает ffmpeg, а на старте это заметная задержка.
@@ -323,7 +364,7 @@ class ProcessingWidgetContent(QWidget):
         preview_group.setToolTip(
 
 
-            "Кадр из середины видео со всеми применёнными настройками.\n\nПоказывает результат до обработки всей подборки.")
+            "Кадр в текущей позиции плеера со всеми применёнными настройками.\n\nПоказывает результат до обработки всей подборки.")
         preview_layout = QVBoxLayout(preview_group)
         self.preview_label = QLabel("Выберите видео и нажмите 'Обновить'")
         self.preview_label.setObjectName("previewLabel")
@@ -801,7 +842,10 @@ class ProcessingWidgetContent(QWidget):
         self.subs_mode_group.buttonClicked.connect(self.on_subs_mode_changed)
         browse_ol_audio_btn.clicked.connect(self.on_browse_overlay_audio)
         clear_ol_audio_btn.clicked.connect(self.overlay_audio_path_edit.clear)
-        self.process_button.clicked.connect(self.start_processing)
+        self.process_button.clicked.connect(self.on_process_clicked)
+        self.video_list_widget.currentItemChanged.connect(self.on_current_video_changed)
+        self.player_panel.trim_changed.connect(self.on_trim_changed)
+        self.player_panel.apply_to_all.connect(self.on_trim_apply_all)
 
         self.on_subs_mode_changed()
         self.on_output_format_changed(self.output_format_combo.currentText())
@@ -830,8 +874,54 @@ class ProcessingWidgetContent(QWidget):
         fs, _ = QFileDialog.getOpenFileName(self, "Выберите аудиофайл", "", "Audio Files (*.mp3 *.wav *.m4a *.aac)")
         if fs: self.overlay_audio_path_edit.setText(fs)
 
+    def on_current_video_changed(self, current, _previous):
+        if current is None:
+            self.player_panel.unload()
+            return
+        start, end = current.data(TRIM_ROLE) or (0.0, None)
+        self.player_panel.load(current.data(Qt.UserRole), start, end)
+
+    def _item_for_path(self, path):
+        for i in range(self.video_list_widget.count()):
+            item = self.video_list_widget.item(i)
+            if item.data(Qt.UserRole) == path:
+                return item
+        return None
+
+    @staticmethod
+    def _trim_value(start, end):
+        return None if (start or 0) <= 0 and end is None else (start or 0.0, end)
+
+    def on_trim_changed(self, path, start, end):
+        item = self._item_for_path(path)
+        if item is not None:
+            item.setData(TRIM_ROLE, self._trim_value(start, end))
+            self.refresh_video_list_display()
+
+    def on_trim_apply_all(self, start, end):
+        value = self._trim_value(start, end)
+        for i in range(self.video_list_widget.count()):
+            item = self.video_list_widget.item(i)
+            if not item.data(Qt.UserRole).lower().endswith('.gif'):
+                item.setData(TRIM_ROLE, value)
+        self.refresh_video_list_display()
+
+    def _preview_time(self, item):
+        """Где брать кадр предпросмотра: позиция плеера, иначе середина отрезка."""
+        path = item.data(Qt.UserRole)
+        if self.player_panel.path == path:
+            return self.player_panel.current_time()
+        trim = item.data(TRIM_ROLE)
+        if trim:
+            start, end = trim
+            if end is None:
+                end = get_video_duration(path)
+            return (start + end) / 2
+        return None
+
     def on_update_preview(self):
-        selected_items = self.video_list_widget.selectedItems()
+        current = self.video_list_widget.currentItem()
+        selected_items = self.video_list_widget.selectedItems() or ([current] if current else [])
         if not selected_items:
             QMessageBox.warning(self, "Видео не выбрано", "Пожалуйста, выберите видео из списка для предпросмотра.")
             return
@@ -861,7 +951,8 @@ class ProcessingWidgetContent(QWidget):
             'crop_filter': crop_filter,
             'filler_path': self.get_filler_path(),
             'split_content_height': self.split_layout_combo.currentData(),
-            'content_on_top': self.split_pos_combo.currentText() == SPLIT_CONTENT_TOP
+            'content_on_top': self.split_pos_combo.currentText() == SPLIT_CONTENT_TOP,
+            'at_time': self._preview_time(selected_items[0]),
         }
         self.set_controls_enabled(False)
         self.preview_label.setText("Генерация предпросмотра...")
@@ -992,7 +1083,11 @@ class ProcessingWidgetContent(QWidget):
                 item.setEnabled(False)
             self.codec_combo.setItemText(index, f"{label} — нет поддержки")
 
-        if working and self.codec_combo.currentIndex() not in working:
+        # Видеокарта по умолчанию, если она есть: H.264 понимают все площадки.
+        preferred = [i for i in working if self.codec_combo.itemData(i) in HARDWARE_H264]
+        if preferred:
+            self.codec_combo.setCurrentIndex(preferred[0])
+        elif working and self.codec_combo.currentIndex() not in working:
             self.codec_combo.setCurrentIndex(working[0])
 
         hardware = [self.codec_combo.itemText(i) for i in working
@@ -1075,7 +1170,15 @@ class ProcessingWidgetContent(QWidget):
             it = self.video_list_widget.item(i)
             f = it.data(Qt.UserRole)
             base_name = os.path.basename(f)
-            it.setText(f"{i + 1}. {base_name}")
+            trim = it.data(TRIM_ROLE)
+            if trim:
+                start, end = trim
+                end_text = format_timecode(end) if end is not None else "конец"
+                it.setText(f"{i + 1}. {base_name}   ✂ {format_timecode(start)} – {end_text}")
+            else:
+                it.setText(f"{i + 1}. {base_name}")
+        if self.video_list_widget.currentItem() is None and self.video_list_widget.count():
+            self.video_list_widget.setCurrentRow(0)
 
     def on_zoom_mode_changed(self):
         is_dynamic = self.zoom_dynamic_radio.isChecked()
@@ -1087,8 +1190,21 @@ class ProcessingWidgetContent(QWidget):
         self.speed_static_widget.setVisible(not is_dynamic)
         self.speed_dynamic_widget.setVisible(is_dynamic)
 
+    def on_process_clicked(self):
+        if self.processing_thread and self.processing_thread.isRunning():
+            self.process_button.setEnabled(False)
+            self.process_button.setText("Останавливаю...")
+            self.processing_thread.stop()
+            return
+        self.start_processing()
+
     def start_processing(self):
         video_files = [self.video_list_widget.item(i).data(Qt.UserRole) for i in range(self.video_list_widget.count())]
+        trims = {}
+        for i in range(self.video_list_widget.count()):
+            item = self.video_list_widget.item(i)
+            if item.data(TRIM_ROLE):
+                trims[item.data(Qt.UserRole)] = item.data(TRIM_ROLE)
         if not video_files:
             QMessageBox.warning(self, "Нет файлов", "Добавьте хотя бы один видео или GIF файл.")
             return
@@ -1140,7 +1256,9 @@ class ProcessingWidgetContent(QWidget):
                 'pitch': self.uq_pitch_cb.isChecked(),
                 'speed': self.uq_speed_cb.isChecked(),
                 'encode': self.uq_encode_cb.isChecked(),
-            }
+            },
+            trims=trims,
+            parallel=self.parallel_spin.value(),
         )
 
         self.processing_thread.progress.connect(self.on_prog)
@@ -1155,11 +1273,12 @@ class ProcessingWidgetContent(QWidget):
         self.progress_label.setText(f"0 / {len(video_files)}")
         self.status_label.setText("Подготовка...")
         self.set_controls_enabled(False)
+        self.process_button.setEnabled(True)
+        self.process_button.setText("Остановить")
         self.processing_thread.start()
 
     def on_prog(self, done, total):
         self.progress_label.setText(f"{done} / {total}")
-        self.progress_bar.setValue(100)
 
     def on_file_prog(self, percentage):
         self.progress_bar.setValue(percentage)
@@ -1169,26 +1288,41 @@ class ProcessingWidgetContent(QWidget):
             fm = QFontMetrics(self.status_label.font())
             elided_text = fm.elidedText(f"Обрабатываю: {fname}", Qt.ElideMiddle, self.status_label.width() - 20)
             self.status_label.setText(elided_text)
-            self.progress_bar.setValue(0)
         except Exception:
             self.status_label.setText(f"Обрабатываю: ...{fname[-30:]}")
-            self.progress_bar.setValue(0)
 
     def on_status_update(self, message: str):
         self.status_label.setText(message)
 
     def on_done(self):
-        if self.processing_thread and not self.processing_thread.isRunning():
-            QMessageBox.information(self, "Готово", "Обработка успешно завершена!")
-        self.set_controls_enabled(True)
-        self.status_label.setText("Готово")
+        thread = self.processing_thread
         self.processing_thread = None
+        self.set_controls_enabled(True)
+        self.process_button.setText("Обработать")
+        if thread is None:
+            return
+        # Сигнал приходит из самого конца run(): дожидаемся выхода потока,
+        # иначе объект QThread мог бы удалиться, пока поток ещё жив.
+        thread.wait(3000)
+        total, ok, errors = len(thread.files), len(thread.output_paths), thread.errors
+        if thread.is_stopped():
+            status = f"Остановлено: готово {ok} из {total}"
+            QMessageBox.information(self, "Остановлено", status)
+        elif errors:
+            status = f"Готово {ok} из {total}, с ошибками: {len(errors)}"
+            details = "\n\n".join(e[:600] for e in errors[:3])
+            if len(errors) > 3:
+                details += f"\n\n...и ещё {len(errors) - 3}"
+            QMessageBox.warning(self, "Обработка завершена с ошибками", f"{status}\n\n{details}")
+        else:
+            status = f"Готово: {ok} из {total}"
+            QMessageBox.information(self, "Готово", "Обработка успешно завершена!")
+        self.status_label.setText(status)
 
     def on_err(self, msg):
-        QMessageBox.critical(self, "Ошибка обработки", f"Произошла ошибка:\n\n{msg}")
-        self.set_controls_enabled(True)
-        self.status_label.setText("Ошибка")
-        self.processing_thread = None
+        # Ошибка одного файла не останавливает партию: остальные продолжают
+        # обрабатываться, сводка будет в конце.
+        self.status_label.setText(msg.splitlines()[0] if msg else "Ошибка")
 
     def on_subtitle_preview(self):
         selected_items = self.video_list_widget.selectedItems()
@@ -1333,9 +1467,10 @@ class VideoUnicApp(QMainWindow):
             if is_running:
                 try:
                     proc_thread.stop()
-                    proc_thread.wait(1000)
+                    proc_thread.wait(5000)
                 except Exception as e:
                     print(f"Error stopping worker thread: {e}")
+            self.processing_widget.player_panel.shutdown()
             self._cleanup_temp_files()
             event.accept()
         else:

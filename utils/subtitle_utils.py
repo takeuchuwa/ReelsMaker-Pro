@@ -23,9 +23,15 @@ LANGUAGE_CODES = {
 }
 
 
-def extract_audio(video_path: str, audio_path: str):
-    cmd = [
-        "-y",
+def extract_audio(video_path: str, audio_path: str,
+                  start: float = 0.0, duration: Optional[float] = None):
+    """Звук для распознавания — только из выбранного отрезка."""
+    cmd = ["-y"]
+    if start > 0:
+        cmd.extend(["-ss", f"{start:.3f}"])
+    if duration:
+        cmd.extend(["-t", f"{duration:.3f}"])
+    cmd += [
         "-i", video_path,
         "-vn",
         "-ar", "16000",

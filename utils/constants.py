@@ -217,6 +217,10 @@ SCENARIOS = {
 
 CODECS = {
     "CPU (H.264 | libx264)": "libx264",
+    # VAAPI — аппаратное кодирование AMD и Intel в Linux. AMF и QSV из списка
+    # ниже — их аналоги для Windows.
+    "Видеокарта Linux (H.264 | h264_vaapi)": "h264_vaapi",
+    "Видеокарта Linux (H.265 | hevc_vaapi)": "hevc_vaapi",
     "NVIDIA (H.264 | h264_nvenc)": "h264_nvenc",
     "NVIDIA (H.265 | hevc_nvenc)": "hevc_nvenc",
     "Intel (H.264 | h264_qsv)": "h264_qsv",

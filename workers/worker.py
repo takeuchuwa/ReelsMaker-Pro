@@ -2,16 +2,22 @@ from PyQt5.QtCore import QThread, pyqtSignal
 import os
 import random
 import subprocess
+import tempfile
+import threading
 import uuid
-from typing import List, Optional, Dict
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Optional, Dict, Tuple
 
-from utils.ffmpeg_utils import process_single, detect_crop_dimensions, pick_random_filler
+from utils.ffmpeg_utils import (process_single, detect_crop_dimensions, pick_random_filler,
+                                plan_input_window, get_video_duration, terminate_all_ffmpeg)
 from utils.constants import RANDOM_FILLER
 from utils.subtitle_utils import extract_audio, generate_srt_from_whisper
 
 
 class Worker(QThread):
     progress = pyqtSignal(int, int)
+    # Общий процент по всей партии: при параллельной обработке у одного
+    # индикатора нет «текущего файла».
     file_progress = pyqtSignal(int)
     finished = pyqtSignal()
     error = pyqtSignal(str)
@@ -48,6 +54,8 @@ class Worker(QThread):
             content_on_top: bool = True,
             uniquify: bool = False,
             uniquify_methods: dict = None,
+            trims: Optional[Dict[str, Tuple[float, Optional[float]]]] = None,
+            parallel: int = 1,
     ):
         super().__init__()
         self.files = list(files)
@@ -78,8 +86,20 @@ class Worker(QThread):
         self.content_on_top = content_on_top
         self.uniquify = uniquify
         self.uniquify_methods = uniquify_methods or {}
+        self.trims = trims or {}
+        self.parallel = max(1, int(parallel))
         self._is_running = True
         self.output_paths = []
+        self.errors = []
+
+        self._lock = threading.Lock()
+        # Распознавание держит модель в памяти и само грузит все ядра: два
+        # сразу только мешают друг другу.
+        self._whisper_lock = threading.Lock()
+        self._percent = {}
+        self._active = []
+        self._done = 0
+        self._reserved_outputs = set()
 
     def pick_zoom(self) -> int:
         # FIX: Correctly return static or dynamic value
@@ -101,7 +121,153 @@ class Worker(QThread):
 
     def stop(self):
         self._is_running = False
+        terminate_all_ffmpeg()
         print("Worker stop requested.")
+
+    def is_stopped(self):
+        return not self._is_running
+
+    def _output_path(self, in_file_path):
+        base_name = os.path.basename(in_file_path)
+        name_part, _ = os.path.splitext(base_name)
+        suffix = "_reels" if self.output_format != "Оригинальный" else "_processed"
+        with self._lock:
+            # Одинаковые имена из разных папок при параллельной работе писали
+            # бы в один файл одновременно.
+            counter = 1
+            while True:
+                tail = "" if counter == 1 else f"_{counter}"
+                candidate = os.path.join(self.out_dir, f"{name_part}{suffix}{tail}.mp4")
+                if (os.path.abspath(candidate) != os.path.abspath(in_file_path)
+                        and candidate not in self._reserved_outputs):
+                    break
+                counter += 1
+            self._reserved_outputs.add(candidate)
+        return candidate
+
+    def _report_progress(self, index, percent):
+        with self._lock:
+            self._percent[index] = percent
+            overall = sum(self._percent.values()) / max(1, len(self.files))
+        self.file_progress.emit(int(overall))
+
+    def _set_active(self, base_name, add):
+        with self._lock:
+            if add:
+                self._active.append(base_name)
+            elif base_name in self._active:
+                self._active.remove(base_name)
+            names = ", ".join(self._active)
+        if names:
+            self.file_processing.emit(names)
+
+    def _process_one(self, index, in_file_path):
+        if not self._is_running:
+            return
+        base_name = os.path.basename(in_file_path)
+        out_file_path = self._output_path(in_file_path)
+        trim_start, trim_end = self.trims.get(in_file_path, (0.0, None))
+
+        self._set_active(base_name, True)
+        srt_path = None
+        temp_audio_path = None
+        crop_filter = None
+        subtitle_mode = self.subtitle_settings.get("mode")
+        srt_origin = 0.0
+
+        try:
+            if self.auto_crop:
+                self.status_update.emit(f"Анализ черных полос: {base_name}")
+                crop_filter = detect_crop_dimensions(in_file_path)
+
+            if subtitle_mode == "whisper":
+                temp_dir = tempfile.gettempdir()
+                temp_audio_path = os.path.join(temp_dir, f"{uuid.uuid4()}.wav")
+                srt_path = os.path.join(temp_dir, f"{uuid.uuid4()}.srt")
+
+                start, span = plan_input_window(
+                    get_video_duration(in_file_path), trim_start, trim_end, None)
+                self.status_update.emit(f"Извлечение аудио из '{base_name}'...")
+                extract_audio(in_file_path, temp_audio_path, start, span)
+                srt_origin = start
+
+                with self._whisper_lock:
+                    if not self._is_running:
+                        return
+                    self.status_update.emit(f"Распознавание речи: {base_name}")
+                    generate_srt_from_whisper(
+                        audio_path=temp_audio_path,
+                        srt_path=srt_path,
+                        model_name=self.subtitle_settings.get("model"),
+                        language=self.subtitle_settings.get("language"),
+                        words_per_line=self.subtitle_settings.get("words_per_line"),
+                        progress_callback=lambda p: self.status_update.emit(
+                            f"Распознавание речи: {base_name} — {p}%")
+                    )
+            elif subtitle_mode == "srt_file":
+                srt_path = self.subtitle_settings.get("srt_path")
+                if not srt_path or not os.path.exists(srt_path):
+                    raise FileNotFoundError(f"Файл субтитров не найден: {srt_path}")
+
+            process_single(
+                in_path=in_file_path,
+                out_path=out_file_path,
+                filters=self.filters,
+                zoom_p=self.pick_zoom(),
+                speed_p=self.pick_speed(),
+                overlay_file=self.overlay_file,
+                overlay_pos=self.overlay_pos,
+                output_format=self.output_format,
+                blur_background=self.blur_background,
+                mute_audio=self.mute_audio,
+                strip_metadata=self.strip_metadata,
+                codec=self.codec,
+                srt_path=srt_path,
+                subtitle_style=self.subtitle_settings.get("style", {}),
+                crop_filter=crop_filter,
+                overlay_audio_path=self.overlay_audio,
+                original_volume=self.original_volume,
+                overlay_volume=self.overlay_volume,
+                filler_path=(pick_random_filler()
+                             if self.filler_path == RANDOM_FILLER
+                             else self.filler_path),
+                split_content_height=self.split_content_height,
+                content_on_top=self.content_on_top,
+                uniquify=self.uniquify,
+                uniquify_methods=self.uniquify_methods,
+                progress_callback=lambda p: self._report_progress(index, p),
+                trim_start=trim_start,
+                trim_end=trim_end,
+                srt_origin=srt_origin,
+            )
+            with self._lock:
+                self.output_paths.append(out_file_path)
+                self._done += 1
+                done = self._done
+            self._report_progress(index, 100)
+            self.progress.emit(done, len(self.files))
+
+        except Exception as e:
+            if not self._is_running:
+                # ffmpeg сняли кнопкой «Остановить» — это не ошибка файла.
+                if os.path.exists(out_file_path):
+                    os.remove(out_file_path)
+                return
+            error_msg = f"Ошибка при обработке файла '{base_name}':\n{type(e).__name__}: {e}"
+            if isinstance(e, subprocess.CalledProcessError) and e.output:
+                error_msg += f"\n\nFFmpeg output:\n{e.output[-500:]}"
+            print(f"Error in worker thread: {error_msg}")
+            with self._lock:
+                self.errors.append(error_msg)
+            self._report_progress(index, 100)
+            self.error.emit(error_msg)
+
+        finally:
+            self._set_active(base_name, False)
+            if temp_audio_path and os.path.exists(temp_audio_path):
+                os.remove(temp_audio_path)
+            if srt_path and subtitle_mode == "whisper" and os.path.exists(srt_path):
+                os.remove(srt_path)
 
     def run(self):
         total_files = len(self.files)
@@ -112,113 +278,18 @@ class Worker(QThread):
         try:
             os.makedirs(self.out_dir, exist_ok=True)
         except OSError as e:
-            self.error.emit(f"Не удалось создать выходную папку: {self.out_dir}\nОшибка: {e}")
+            message = f"Не удалось создать выходную папку: {self.out_dir}\nОшибка: {e}"
+            self.errors.append(message)
+            self.error.emit(message)
+            self.finished.emit()
             return
 
-        for i, in_file_path in enumerate(self.files):
-            if not self._is_running:
-                print("Worker stopped.")
-                break
-
-            base_name = os.path.basename(in_file_path)
-            name_part, _ = os.path.splitext(base_name)
-            suffix = "_reels" if self.output_format != "Оригинальный" else "_processed"
-            out_file_name = f"{name_part}{suffix}.mp4"
-            out_file_path = os.path.join(self.out_dir, out_file_name)
-
-            if os.path.abspath(in_file_path) == os.path.abspath(out_file_path):
-                alt_out_file_name = f"{name_part}{suffix}_output.mp4"
-                out_file_path = os.path.join(self.out_dir, alt_out_file_name)
-                print(f"Warning: Output path is same as input. Saving to: {alt_out_file_name}")
-
-            self.file_processing.emit(base_name)
-            self.file_progress.emit(0)
-
-            srt_path = None
-            temp_audio_path = None
-            crop_filter = None
-
-            try:
-                if self.auto_crop:
-                    self.status_update.emit("Анализ черных полос...")
-                    crop_filter = detect_crop_dimensions(in_file_path)
-                    self.status_update.emit("Обработка...")
-
-                subtitle_mode = self.subtitle_settings.get("mode")
-                if subtitle_mode == "whisper":
-                    temp_dir = self.out_dir
-                    temp_audio_path = os.path.join(temp_dir, f"{uuid.uuid4()}.wav")
-                    srt_path = os.path.join(temp_dir, f"{uuid.uuid4()}.srt")
-
-                    self.status_update.emit(f"Извлечение аудио из '{base_name}'...")
-                    extract_audio(in_file_path, temp_audio_path)
-
-                    self.status_update.emit("Распознавание речи...")
-                    generate_srt_from_whisper(
-                        audio_path=temp_audio_path,
-                        srt_path=srt_path,
-                        model_name=self.subtitle_settings.get("model"),
-                        language=self.subtitle_settings.get("language"),
-                        words_per_line=self.subtitle_settings.get("words_per_line"),
-                        progress_callback=lambda p: self.status_update.emit(
-                            f"Распознавание речи... {p}%")
-                    )
-                    self.file_processing.emit(base_name)
-                elif subtitle_mode == "srt_file":
-                    srt_path = self.subtitle_settings.get("srt_path")
-                    if not srt_path or not os.path.exists(srt_path):
-                        raise FileNotFoundError(f"Файл субтитров не найден: {srt_path}")
-
-                current_zoom = self.pick_zoom()
-                current_speed = self.pick_speed()
-
-                process_single(
-                    in_path=in_file_path,
-                    out_path=out_file_path,
-                    filters=self.filters,
-                    zoom_p=current_zoom,
-                    speed_p=current_speed,
-                    overlay_file=self.overlay_file,
-                    overlay_pos=self.overlay_pos,
-                    output_format=self.output_format,
-                    blur_background=self.blur_background,
-                    mute_audio=self.mute_audio,
-                    strip_metadata=self.strip_metadata,
-                    codec=self.codec,
-                    srt_path=srt_path,
-                    subtitle_style=self.subtitle_settings.get("style", {}),
-                    crop_filter=crop_filter,
-                    overlay_audio_path=self.overlay_audio,
-                    original_volume=self.original_volume,
-                    overlay_volume=self.overlay_volume,
-                    filler_path=(pick_random_filler()
-                                 if self.filler_path == RANDOM_FILLER
-                                 else self.filler_path),
-                    split_content_height=self.split_content_height,
-                    content_on_top=self.content_on_top,
-                    uniquify=self.uniquify,
-                    uniquify_methods=self.uniquify_methods,
-                    progress_callback=self.file_progress.emit
-                )
-                self.output_paths.append(out_file_path)
-                self.progress.emit(i + 1, total_files)
-
-            except Exception as e:
-                error_msg = f"Ошибка при обработке файла '{base_name}':\n{type(e).__name__}: {e}"
-                if isinstance(e, subprocess.CalledProcessError) and e.output:
-                    error_msg += f"\n\nFFmpeg output:\n{e.output[-500:]}"
-                print(f"Error in worker thread: {error_msg}")
-                self.error.emit(error_msg)
-                continue
-
-            finally:
-                if temp_audio_path and os.path.exists(temp_audio_path):
-                    os.remove(temp_audio_path)
-                if srt_path and subtitle_mode == "whisper" and os.path.exists(srt_path):
-                    os.remove(srt_path)
+        with ThreadPoolExecutor(max_workers=min(self.parallel, total_files)) as pool:
+            for index, path in enumerate(self.files):
+                pool.submit(self._process_one, index, path)
 
         if self._is_running:
             print("Worker finished processing all files.")
-            self.finished.emit()
         else:
             print("Worker finished due to stop request.")
+        self.finished.emit()
