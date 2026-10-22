@@ -433,6 +433,15 @@ def build_uniquify_plan(in_path: str, methods: Optional[Dict] = None) -> Dict:
     }
 
 
+def ass_color(hex_color: str, default: str = "#FFFFFF") -> str:
+    """#RRGGBB -> &H00BBGGRR: в субтитрах ASS порядок каналов обратный."""
+    value = (hex_color or default).lstrip('#')
+    if len(value) != 6:
+        value = default.lstrip('#')
+    r, g, b = value[0:2], value[2:4], value[4:6]
+    return f"&H00{b}{g}{r}".upper()
+
+
 def plan_input_window(source: float, trim_start: float, trim_end: Optional[float],
                       unique: Optional[Dict]) -> Tuple[float, Optional[float]]:
     """Какой кусок исходника читать: (начало, длительность или None до конца).
@@ -631,7 +640,9 @@ def process_single(
 
     if srt_path and subtitle_style:
         sanitized_srt_path = srt_path.replace('\\', '/').replace(':', '\\:')
-        font_size = subtitle_style.get("font_size", 36)
+        font_size = subtitle_style.get("font_size", 12)
+        primary = ass_color(subtitle_style.get("color"), "#FFFFFF")
+        outline = ass_color(subtitle_style.get("outline_color"), "#000000")
 
         position_code = 2
         vertical_margin = 70
@@ -643,9 +654,9 @@ def process_single(
             f"MarginV={vertical_margin}",
             "FontName=Arial",
             f"FontSize={font_size}",
-            "PrimaryColour=&HFFFFFF",
+            f"PrimaryColour={primary}",
             "BorderStyle=1",
-            "OutlineColour=&H000000",
+            f"OutlineColour={outline}",
             "Outline=2",
             "Shadow=1"
         ]

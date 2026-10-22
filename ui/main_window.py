@@ -9,6 +9,7 @@ import logging
 
 from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QThread
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QIcon, QPixmap
+from PyQt5.QtWidgets import QColorDialog
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QListWidget, QAbstractItemView, QFileDialog, QSpinBox,
@@ -722,9 +723,17 @@ class ProcessingWidgetContent(QWidget):
         common_style_layout = QHBoxLayout()
         common_style_layout.addWidget(QLabel("Размер (pt):"))
         self.subs_size_spin = QSpinBox()
-        self.subs_size_spin.setRange(10, 100)
-        self.subs_size_spin.setValue(36)
+        self.subs_size_spin.setRange(6, 100)
+        self.subs_size_spin.setValue(12)
+        self.subs_size_spin.setToolTip(
+            "Размер в единицах субтитров: 12 — примерно 1/24 высоты кадра,\n"
+            "на вертикальном видео 1080x1920 это около 80 пикселей.")
         common_style_layout.addWidget(self.subs_size_spin)
+
+        self.subs_color_btn = self._make_color_button("Текст", "#FFFFFF")
+        self.subs_outline_btn = self._make_color_button("Обводка", "#000000")
+        common_style_layout.addWidget(self.subs_color_btn)
+        common_style_layout.addWidget(self.subs_outline_btn)
 
         self.subs_preview_btn = QPushButton("Предпросмотр стиля")
         self.subs_preview_btn.clicked.connect(self.on_subtitle_preview)
@@ -854,6 +863,33 @@ class ProcessingWidgetContent(QWidget):
         self.video_list_widget.files_dropped.connect(self.refresh_video_list_display)
         self.subs_from_file_radio.toggled.connect(self.update_preview_btn_state)
         self.subs_srt_path.textChanged.connect(self.update_preview_btn_state)
+
+    def _make_color_button(self, title, initial):
+        btn = QPushButton(title)
+        btn.setToolTip(f"{title}: выбрать цвет")
+
+        def show(color):
+            btn.setProperty("color_value", color)
+            swatch = QPixmap(16, 16)
+            swatch.fill(QColor(color))
+            btn.setIcon(QIcon(swatch))
+
+        def pick():
+            chosen = QColorDialog.getColor(QColor(btn.property("color_value")), self, title)
+            if chosen.isValid():
+                show(chosen.name())
+
+        btn.set_color = show
+        btn.clicked.connect(pick)
+        show(initial)
+        return btn
+
+    def subtitle_style(self):
+        return {
+            "font_size": self.subs_size_spin.value(),
+            "color": self.subs_color_btn.property("color_value"),
+            "outline_color": self.subs_outline_btn.property("color_value"),
+        }
 
     def update_preview_btn_state(self):
         is_file_mode = self.subs_from_file_radio.isChecked()
@@ -1221,7 +1257,7 @@ class ProcessingWidgetContent(QWidget):
             subtitle_settings["language"] = self.subs_lang_combo.currentText()
             subtitle_settings["words_per_line"] = self.subs_words_spin.value()
 
-        subtitle_settings["style"] = {"font_size": self.subs_size_spin.value()}
+        subtitle_settings["style"] = self.subtitle_style()
 
         self.processing_thread = Worker(
             files=video_files,
@@ -1345,10 +1381,15 @@ class ProcessingWidgetContent(QWidget):
                               "Сначала сгенерируйте субтитры или укажите готовый .srt файл.")
             return
 
-        dialog = SubtitlePreviewDialog(video_path, srt_path, self)
+        current = self.subtitle_style()
+        dialog = SubtitlePreviewDialog(video_path, srt_path, self, initial_style={
+            'size': current['font_size'], 'color': current['color'],
+            'outline_color': current['outline_color']})
         if dialog.exec_() == QDialog.Accepted:
             style = dialog.get_style()
-            self.subs_size_spin.setValue(style.get('size', 36))
+            self.subs_size_spin.setValue(style.get('size', 12))
+            self.subs_color_btn.set_color(style.get('color', '#FFFFFF'))
+            self.subs_outline_btn.set_color(style.get('outline_color', '#000000'))
 
 
 class VideoUnicApp(QMainWindow):

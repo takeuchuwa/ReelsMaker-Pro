@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QPixmap, QColor
 from utils.constants import SUBTITLE_PRESETS
-from utils.ffmpeg_utils import run_ffmpeg, get_video_duration
+from utils.ffmpeg_utils import run_ffmpeg, get_video_duration, ass_color
 
 class SubtitlePreviewGenerator(QThread):
     finished_signal = pyqtSignal(str)
@@ -30,8 +30,8 @@ class SubtitlePreviewGenerator(QThread):
 
             font = self.style_params.get('font', 'Arial')
             size = self.style_params.get('size', 36)
-            color = self.style_params.get('color', '#FFFFFF').replace('#', '&H') + '&'
-            outline_color = self.style_params.get('outline_color', '#000000').replace('#', '&H') + '&'
+            color = ass_color(self.style_params.get('color'), '#FFFFFF')
+            outline_color = ass_color(self.style_params.get('outline_color'), '#000000')
             outline_width = self.style_params.get('outline_width', 2)
             shadow = self.style_params.get('shadow', 1)
             position = self.style_params.get('position', 2)
@@ -64,13 +64,15 @@ class SubtitlePreviewGenerator(QThread):
             self.error_signal.emit(str(e))
 
 class SubtitlePreviewDialog(QDialog):
-    def __init__(self, video_path, srt_path, parent=None):
+    def __init__(self, video_path, srt_path, parent=None, initial_style=None):
         super().__init__(parent)
         self.video_path = video_path
         self.srt_path = srt_path
         self.temp_files = []
         self.preview_thread = None
         self.current_style = SUBTITLE_PRESETS["Классический"].copy()
+        # Окно открывается с тем, что уже выбрано на главном экране.
+        self.current_style.update(initial_style or {})
 
         self.setWindowTitle("Предпросмотр субтитров")
         self.setMinimumSize(900, 700)
@@ -111,7 +113,7 @@ class SubtitlePreviewDialog(QDialog):
         size_layout = QHBoxLayout()
         size_layout.addWidget(QLabel("Размер:"))
         self.size_spin = QSpinBox()
-        self.size_spin.setRange(20, 80)
+        self.size_spin.setRange(6, 100)
         self.size_spin.setValue(self.current_style['size'])
         self.size_spin.valueChanged.connect(self.on_style_changed)
         size_layout.addWidget(self.size_spin)
