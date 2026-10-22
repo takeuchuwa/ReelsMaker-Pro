@@ -42,8 +42,16 @@ def setup_logging():
     )
 
 
+def use_native_file_dialogs():
+    # Qt из pip не содержит KDE-плагина, и без этого открывается встроенный
+    # диалог Qt. Через портал KDE отдаёт свой диалог выбора - как в Dolphin.
+    if sys.platform.startswith("linux"):
+        os.environ.setdefault("QT_QPA_PLATFORMTHEME", "xdgdesktopportal")
+
+
 def main():
     setup_logging()
+    use_native_file_dialogs()
     logging.info(f"{APP_NAME} {APP_VERSION} started.")
 
     app = QApplication(sys.argv)
