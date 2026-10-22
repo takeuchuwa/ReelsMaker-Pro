@@ -450,8 +450,14 @@ class PlayerPanel(QWidget):
             edit.setToolTip(tip)
             edit.editingFinished.connect(self._on_edits)
         self.end_edit.setPlaceholderText("до конца")
-        self.btn_mark_in = tool('fa5s.map-marker-alt', "Начало отрезка — текущая позиция  I", self.mark_in)
-        self.btn_mark_out = tool('fa5s.map-marker-alt', "Конец отрезка — текущая позиция  O", self.mark_out)
+        self.btn_mark_in = tool('fa5s.map-marker-alt', "Начать отрезок с текущей позиции  I", self.mark_in)
+        self.btn_mark_in.setText("Отсюда")
+        self.btn_mark_out = tool('fa5s.map-marker-alt', "Закончить отрезок на текущей позиции  O", self.mark_out)
+        self.btn_mark_out.setText("Досюда")
+        # Один значок не объяснял, что кнопка делает: подпись важнее места.
+        for btn in (self.btn_mark_in, self.btn_mark_out):
+            btn.setMinimumWidth(0)
+            btn.setMaximumWidth(16777215)
         self.btn_reset = QPushButton("Весь ролик")
         self.btn_reset.setToolTip("Сбросить отрезок")
         self.btn_reset.clicked.connect(self.reset_trim)
