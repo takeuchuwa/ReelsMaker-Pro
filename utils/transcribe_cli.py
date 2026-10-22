@@ -32,6 +32,26 @@ def _format_time(seconds):
     return '%02d:%02d:%02d,%03d' % (int(h), int(m), int(s), ms)
 
 
+def _read_wav(path):
+    """WAV от extract_audio (16 кГц, моно, 16 бит) как массив для модели.
+
+    Путь к файлу faster-whisper разбирает через PyAV, а свежий PyAV убрал
+    параметр, который тот передаёт, — распознавание падало на открытии файла.
+    Звук уже подготовлен ffmpeg, так что декодер не нужен вовсе.
+    """
+    import wave
+    import numpy as np
+    with wave.open(path, 'rb') as handle:
+        if handle.getsampwidth() != 2 or handle.getframerate() != 16000:
+            raise ValueError('ожидался WAV 16 кГц, 16 бит')
+        frames = handle.readframes(handle.getnframes())
+        channels = handle.getnchannels()
+    audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+    return audio
+
+
 def run(args):
     from faster_whisper import WhisperModel
 
@@ -45,7 +65,7 @@ def run(args):
         language = LANGUAGE_CODES.get(args.language.lower(), args.language.lower())
 
     _emit('STAGE', 'transcribing')
-    segments, info = model.transcribe(args.audio, language=language,
+    segments, info = model.transcribe(_read_wav(args.audio), language=language,
                                       word_timestamps=True)
 
     total = getattr(info, 'duration', 0) or 0
@@ -61,7 +81,7 @@ def run(args):
             chunk = words[start:start + args.words_per_line]
             if not chunk:
                 continue
-            text = ' '.join(word.word for word in chunk).strip()
+            text = ' '.join(word.word.strip() for word in chunk).strip()
             lines.append('%d\n%s --> %s\n%s\n\n' % (
                 index, _format_time(chunk[0].start), _format_time(chunk[-1].end), text))
             index += 1

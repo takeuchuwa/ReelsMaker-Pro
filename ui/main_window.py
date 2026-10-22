@@ -706,7 +706,7 @@ class ProcessingWidgetContent(QWidget):
         whisper_row2.addWidget(QLabel("Язык:"))
         self.subs_lang_combo = QComboBox()
         self.subs_lang_combo.addItems(WHISPER_LANGUAGES)
-        self.subs_lang_combo.setCurrentText("Russian")
+        self.subs_lang_combo.setCurrentText("Ukrainian")
         whisper_row2.addWidget(self.subs_lang_combo)
         subs_whisper_layout.addLayout(whisper_row2)
         whisper_row3 = QHBoxLayout()
