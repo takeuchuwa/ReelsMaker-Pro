@@ -229,5 +229,6 @@ CODECS = {
     "AMD (H.265 | hevc_amf)": "hevc_amf",
 }
 
-WHISPER_MODELS = ["tiny", "base", "small", "medium", "large"]
+# turbo — урезанный декодер large-v3: качество близко к large, скорость ближе к small.
+WHISPER_MODELS = ["tiny", "base", "small", "medium", "turbo", "large"]
 WHISPER_LANGUAGES = ["Auto-detect", "Russian", "English", "Ukrainian", "German", "French", "Spanish", "Italian"]

@@ -701,7 +701,10 @@ class ProcessingWidgetContent(QWidget):
         whisper_row1.addWidget(QLabel("Модель:"))
         self.subs_model_combo = QComboBox()
         self.subs_model_combo.addItems(WHISPER_MODELS)
-        self.subs_model_combo.setCurrentText("base")
+        self.subs_model_combo.setCurrentText("medium")
+        self.subs_model_combo.setToolTip(
+            "Размер при первом скачивании: small ~0.5 ГБ, medium ~1.5 ГБ,\n"
+            "turbo ~1.6 ГБ, large ~3 ГБ. Больше — точнее, но медленнее.")
         whisper_row1.addWidget(self.subs_model_combo)
         subs_whisper_layout.addLayout(whisper_row1)
         whisper_row2 = QHBoxLayout()
