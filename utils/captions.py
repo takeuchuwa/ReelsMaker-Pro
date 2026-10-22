@@ -209,6 +209,7 @@ def build_ass(lines: List[Line], style: dict, mode: str) -> str:
     highlight = ass_color(style.get("highlight_color"), "#FFD400")
     size = style.get("font_size", 12)
     font = (style.get("font") or "Arial").replace(",", " ")
+    border = max(0.0, float(style.get("outline_width", 2)))
     # 384x288 — то же поле, в которое ffmpeg переводит SRT: размеры и отступы
     # значат ровно то же, что и раньше.
     header = (
@@ -219,7 +220,7 @@ def build_ass(lines: List[Line], style: dict, mode: str) -> str:
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
         "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
         f"Style: Default,{font},{size},{primary},{primary},{outline},&H80000000,"
-        "0,0,0,0,100,100,0,0,1,2,1,2,25,25,70,1\n\n"
+        f"0,0,0,0,100,100,0,0,1,{border:g},1,2,25,25,70,1\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
     events = []
 

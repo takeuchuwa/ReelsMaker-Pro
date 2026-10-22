@@ -7,9 +7,9 @@ import shutil
 import subprocess
 import logging
 
-from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QThread, QSettings, QTimer
+from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QThread, QSettings
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QIcon, QPixmap
-from PyQt5.QtWidgets import QColorDialog, QFontComboBox
+from PyQt5.QtWidgets import QColorDialog, QFontComboBox, QDoubleSpinBox
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QListWidget, QAbstractItemView, QFileDialog, QSpinBox,
@@ -57,12 +57,21 @@ class PreviewWorker(QThread):
     finished_signal = pyqtSignal(str)
     error_signal = pyqtSignal(str)
 
-    def __init__(self, params):
+    def __init__(self, params, auto_crop=False, crop_cache=None):
         super().__init__()
         self.params = params
+        self.auto_crop = auto_crop
+        self.crop_cache = crop_cache if crop_cache is not None else {}
 
     def run(self):
         try:
+            # Поиск чёрных полос декодирует несколько секунд видео: в главном
+            # потоке он замораживал окно. Результат на файл один — запоминаем.
+            if self.auto_crop:
+                path = self.params['in_path']
+                if path not in self.crop_cache:
+                    self.crop_cache[path] = detect_crop_dimensions(path)
+                self.params['crop_filter'] = self.crop_cache[path]
             generate_preview(**self.params)
             self.finished_signal.emit(self.params['out_path'])
         except Exception as e:
@@ -201,6 +210,7 @@ class ProcessingWidgetContent(QWidget):
         super().__init__(parent_window)
         self.parent_window = parent_window
         self.preview_thread = None
+        self.crop_cache = {}
         self.processing_thread = None
         self.last_output_path = None
         self.init_ui()
@@ -755,6 +765,14 @@ class ProcessingWidgetContent(QWidget):
         self.subs_outline_btn = self._make_color_button("Обводка", "#000000")
         common_style_layout.addWidget(self.subs_color_btn)
         common_style_layout.addWidget(self.subs_outline_btn)
+        self.subs_outline_spin = QDoubleSpinBox()
+        self.subs_outline_spin.setRange(0, 10)
+        self.subs_outline_spin.setSingleStep(0.5)
+        self.subs_outline_spin.setDecimals(1)
+        self.subs_outline_spin.setValue(2)
+        self.subs_outline_spin.setFixedWidth(70)
+        self.subs_outline_spin.setToolTip("Толщина обводки. 0 — без обводки.")
+        common_style_layout.addWidget(self.subs_outline_spin)
 
         anim_layout = QHBoxLayout()
         anim_layout.addWidget(QLabel("Анимация:"))
@@ -913,6 +931,7 @@ class ProcessingWidgetContent(QWidget):
         self.load_subtitle_settings()
         self.subs_anim_combo.currentIndexChanged.connect(self.on_subs_anim_changed)
         self.subs_size_spin.valueChanged.connect(self.save_subtitle_settings)
+        self.subs_outline_spin.valueChanged.connect(self.save_subtitle_settings)
         self.subs_hints_edit.editingFinished.connect(self.save_subtitle_settings)
         self.subs_fixes_edit.textChanged.connect(self.save_subtitle_settings)
         self.subs_font_combo.currentFontChanged.connect(self.save_subtitle_settings)
@@ -920,15 +939,6 @@ class ProcessingWidgetContent(QWidget):
         self.on_zoom_mode_changed()
         self.on_speed_mode_changed()
         self.video_list_widget.files_dropped.connect(self.refresh_video_list_display)
-        # Стиль субтитров виден на предпросмотре: после правки кадр
-        # перерисовывается сам, без нажатия «Обновить».
-        self.preview_refresh_timer = QTimer(self)
-        self.preview_refresh_timer.setSingleShot(True)
-        self.preview_refresh_timer.setInterval(450)
-        self.preview_refresh_timer.timeout.connect(self.refresh_preview_if_shown)
-        for signal in (self.subs_size_spin.valueChanged, self.subs_anim_combo.currentIndexChanged,
-                       self.subs_font_combo.currentFontChanged, self.subs_mode_group.buttonClicked):
-            signal.connect(lambda *_: self.preview_refresh_timer.start())
 
     def _make_color_button(self, title, initial):
         btn = QPushButton(title)
@@ -945,7 +955,6 @@ class ProcessingWidgetContent(QWidget):
             if chosen.isValid():
                 show(chosen.name())
                 self.save_subtitle_settings()
-                self.preview_refresh_timer.start()
 
         btn.set_color = show
         btn.clicked.connect(pick)
@@ -958,6 +967,7 @@ class ProcessingWidgetContent(QWidget):
             "color": self.subs_color_btn.property("color_value"),
             "outline_color": self.subs_outline_btn.property("color_value"),
             "highlight_color": self.subs_highlight_btn.property("color_value"),
+            "outline_width": self.subs_outline_spin.value(),
             "mode": self.subs_anim_combo.currentData(),
             "font": self.subs_font_combo.currentFont().family(),
         }
@@ -974,6 +984,7 @@ class ProcessingWidgetContent(QWidget):
             self.subs_size_spin.setValue(int(st.value("subtitles/size", 12)))
             self.subs_color_btn.set_color(st.value("subtitles/color", "#FFFFFF"))
             self.subs_outline_btn.set_color(st.value("subtitles/outline_color", "#000000"))
+            self.subs_outline_spin.setValue(float(st.value("subtitles/outline_width", 2)))
             self.subs_highlight_btn.set_color(st.value("subtitles/highlight_color", "#FFD400"))
             index = self.subs_anim_combo.findData(st.value("subtitles/mode", MODE_STATIC))
             self.subs_anim_combo.setCurrentIndex(max(0, index))
@@ -992,6 +1003,7 @@ class ProcessingWidgetContent(QWidget):
         st.setValue("subtitles/size", style["font_size"])
         st.setValue("subtitles/color", style["color"])
         st.setValue("subtitles/outline_color", style["outline_color"])
+        st.setValue("subtitles/outline_width", style["outline_width"])
         st.setValue("subtitles/highlight_color", style["highlight_color"])
         st.setValue("subtitles/mode", style["mode"])
         st.setValue("subtitles/hints", self.subs_hints_edit.text())
@@ -1071,16 +1083,6 @@ class ProcessingWidgetContent(QWidget):
         in_path = selected_items[0].data(Qt.UserRole)
         temp_preview_path = os.path.join(self.parent_window.temp_dir, f"preview_{uuid.uuid4()}.png")
 
-        crop_filter = None
-        if self.auto_crop_checkbox.isChecked():
-            self.preview_label.setText("Анализ кадра для обрезки...")
-            QApplication.processEvents()
-            try:
-                crop_filter = detect_crop_dimensions(in_path)
-            except Exception as e:
-                self.on_preview_error(f"Не удалось определить размеры обрезки: {e}")
-                return
-
         params = {
             'in_path': in_path,
             'out_path': temp_preview_path,
@@ -1090,7 +1092,7 @@ class ProcessingWidgetContent(QWidget):
             'overlay_pos': self.overlay_pos_combo.currentText(),
             'output_format': self.output_format_combo.currentText(),
             'blur_background': self.blur_background_checkbox.isChecked(),
-            'crop_filter': crop_filter,
+            'crop_filter': None,
             'filler_path': self.get_filler_path(),
             'split_content_height': self.split_layout_combo.currentData(),
             'content_on_top': self.split_pos_combo.currentText() == SPLIT_CONTENT_TOP,
@@ -1101,17 +1103,11 @@ class ProcessingWidgetContent(QWidget):
         self.preview_label.setText("Генерация предпросмотра...")
         self.parent_window.temp_files.append(temp_preview_path)
 
-        self.preview_thread = PreviewWorker(params)
+        self.preview_thread = PreviewWorker(params, self.auto_crop_checkbox.isChecked(),
+                                            self.crop_cache)
         self.preview_thread.finished_signal.connect(self.on_preview_finished)
         self.preview_thread.error_signal.connect(self.on_preview_error)
         self.preview_thread.start()
-
-    def refresh_preview_if_shown(self):
-        """Перерисовать кадр, если он уже был показан и ничего не занято."""
-        busy = (self.preview_thread and self.preview_thread.isRunning()) or \
-               (self.processing_thread and self.processing_thread.isRunning())
-        if self.last_preview_image and not busy:
-            self.on_update_preview()
 
     def open_preview_large(self):
         if self.last_preview_image and os.path.exists(self.last_preview_image):
@@ -1602,7 +1598,6 @@ class VideoUnicApp(QMainWindow):
                 except Exception as e:
                     print(f"Error stopping worker thread: {e}")
             content = self.processing_widget
-            content.preview_refresh_timer.stop()
             for thread in (content.preview_thread, content.codec_probe):
                 if thread is not None and thread.isRunning():
                     thread.wait(10000)
