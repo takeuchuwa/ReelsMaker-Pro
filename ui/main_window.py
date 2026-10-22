@@ -818,6 +818,11 @@ class ProcessingWidgetContent(QWidget):
         # fontconfig, ему доступно ровно то же, что видит система.
         self.subs_font_combo = QFontComboBox()
         self.subs_font_combo.setEditable(False)
+        # В стиле Fusion список раскрывался на всю высоту экрана: шрифтов в
+        # системе сотни. combobox-popup: 0 включает обычный выпадающий список,
+        # который слушается ограничения на число строк.
+        self.subs_font_combo.setStyleSheet("QComboBox { combobox-popup: 0; }")
+        self.subs_font_combo.setMaxVisibleItems(12)
         font_layout.addWidget(self.subs_font_combo, 1)
         subs_main_layout.addLayout(font_layout)
 
