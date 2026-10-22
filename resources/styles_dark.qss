@@ -266,6 +266,40 @@ QListWidget::item:selected {
     color: #e9ebee;
 }
 
+/* Таблица проверки субтитров: без своих правил Qt рисовал её белой, а
+   светлый текст темы на белом не читался. */
+QTableView {
+    background-color: #1c1e23;
+    alternate-background-color: #1b1d21;
+    color: #e9ebee;
+    gridline-color: #3a3f49;
+    border: 1px solid #3a3f49;
+    border-radius: 8px;
+    selection-background-color: #12302c;
+    selection-color: #e9ebee;
+    outline: none;
+}
+QHeaderView::section {
+    background-color: #24272e;
+    color: #aab0ba;
+    border: none;
+    border-right: 1px solid #3a3f49;
+    border-bottom: 1px solid #3a3f49;
+    padding: 6px 8px;
+    font-weight: 600;
+}
+QTableCornerButton::section {
+    background-color: #24272e;
+    border: none;
+}
+/* Редактор ячейки — обычный QLineEdit; с отступами поля ввода он не
+   помещался в строку таблицы. */
+QTableView QLineEdit {
+    padding: 0 4px;
+    min-height: 0;
+    border-radius: 0;
+}
+
 QProgressBar {
     background-color: #1b1d21;
     border: 1px solid #3a3f49;

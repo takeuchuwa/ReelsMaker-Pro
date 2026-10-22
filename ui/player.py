@@ -369,6 +369,7 @@ class PlayerPanel(QWidget):
         # Остановленные загрузчики дорабатывают текущую миниатюру: держим их,
         # пока не выйдут, иначе Qt уничтожит работающий поток.
         self._retired_loaders = []
+        self._segment_end = None
         self.view = None
         self._build()
         self._set_enabled(False)
@@ -580,7 +581,22 @@ class PlayerPanel(QWidget):
         except Exception as error:
             logger.warning(f"seek failed: {error}")
 
+    def play_segment(self, start, end, attempts=20):
+        """Проиграть отрезок и встать на паузу в его конце. Файл мог только
+        начать загружаться — тогда поиск не удастся, пробуем чуть позже."""
+        if self.view is None:
+            return
+        try:
+            self.view.player.command('seek', f"{start:.3f}", 'absolute+exact')
+        except Exception:
+            if attempts:
+                QTimer.singleShot(150, lambda: self.play_segment(start, end, attempts - 1))
+            return
+        self._segment_end = end
+        self.view.player.pause = False
+
     def toggle_play(self):
+        self._segment_end = None
         if self.view is None or self.path is None:
             return
         player = self.view.player
@@ -637,6 +653,9 @@ class PlayerPanel(QWidget):
     def _on_position(self, t):
         if self.path is None:
             return
+        if self._segment_end is not None and t >= self._segment_end:
+            self._segment_end = None
+            self.view.player.pause = True
         self.timeline.set_position(t)
         self._update_time_label(t)
 

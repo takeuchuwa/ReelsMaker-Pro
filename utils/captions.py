@@ -172,6 +172,43 @@ def apply_fixes(lines: List[Line], rules) -> List[Line]:
     return result
 
 
+# --- ручная правка --------------------------------------------------------
+def edit_line_text(line: Line, text: str) -> List[Line]:
+    """Новый текст строки. Если слов столько же, время каждого сохраняется;
+    иначе раскладывается по длине слов. Символ | делит строку на несколько.
+    Пустой текст — строка удалена."""
+    segments = [seg.split() for seg in text.split("|")]
+    segments = [seg for seg in segments if seg]
+    tokens = [t for seg in segments for t in seg]
+    if not tokens or not line:
+        return []
+    if len(tokens) == len(line):
+        times = [(w.start, w.end) for w in line]
+    else:
+        start, end = line[0].start, line[-1].end
+        weights = [len(t.strip(_PUNCT)) + 1 for t in tokens]
+        total, at, times = sum(weights), start, []
+        for weight in weights:
+            span = (end - start) * weight / total
+            times.append((at, at + span))
+            at += span
+    words = [Word(t, a, b) for t, (a, b) in zip(tokens, times)]
+    lines, i = [], 0
+    for seg in segments:
+        lines.append(words[i:i + len(seg)])
+        i += len(seg)
+    return lines
+
+
+def retime_line(line: Line, start: float, end: float) -> Line:
+    """Строка в новых границах; слова растягиваются пропорционально."""
+    old_start, old_end = line[0].start, line[-1].end
+    old_span = max(old_end - old_start, 1e-6)
+    scale = (end - start) / old_span
+    return [Word(w.text, start + (w.start - old_start) * scale,
+                 start + (w.end - old_start) * scale) for w in line]
+
+
 # --- время ----------------------------------------------------------------
 def shift_lines(lines: List[Line], offset: float, limit: Optional[float] = None) -> List[Line]:
     """Сдвиг к началу результата: offset — какая секунда исходника стала нулём.

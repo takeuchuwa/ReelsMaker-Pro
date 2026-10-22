@@ -25,6 +25,8 @@ class Worker(QThread):
     error = pyqtSignal(str)
     file_processing = pyqtSignal(str)
     status_update = pyqtSignal(str)
+    # Субтитры всех файлов готовы и ждут проверки: {путь: строки}.
+    captions_ready = pyqtSignal(object)
 
     def __init__(
             self,
@@ -58,6 +60,7 @@ class Worker(QThread):
             uniquify_methods: dict = None,
             trims: Optional[Dict[str, Tuple[float, Optional[float]]]] = None,
             parallel: int = 1,
+            review_subtitles: bool = False,
     ):
         super().__init__()
         self.files = list(files)
@@ -102,6 +105,12 @@ class Worker(QThread):
         self._active = []
         self._done = 0
         self._reserved_outputs = set()
+        self.review_subtitles = review_subtitles
+        self._prepared = {}
+        self._failed = set()
+        self._review_event = threading.Event()
+        self._reviewed = None
+        self.cancelled_at_review = False
 
     def pick_zoom(self) -> int:
         # FIX: Correctly return static or dynamic value
@@ -123,6 +132,7 @@ class Worker(QThread):
 
     def stop(self):
         self._is_running = False
+        self._review_event.set()
         terminate_all_ffmpeg()
         print("Worker stop requested.")
 
@@ -163,25 +173,13 @@ class Worker(QThread):
         if names:
             self.file_processing.emit(names)
 
-    def _process_one(self, index, in_file_path):
-        if not self._is_running:
-            return
-        base_name = os.path.basename(in_file_path)
-        out_file_path = self._output_path(in_file_path)
-        trim_start, trim_end = self.trims.get(in_file_path, (0.0, None))
-
-        self._set_active(base_name, True)
-        words_path = None
-        temp_audio_path = None
-        crop_filter = None
-        caption_lines = None
+    def _prepare_captions(self, in_file_path, base_name):
+        """Строки субтитров из слов со временем исходника, уже с автозаменами."""
         subtitle_mode = self.subtitle_settings.get("mode")
-
+        trim_start, trim_end = self.trims.get(in_file_path, (0.0, None))
+        caption_lines = None
+        temp_audio_path = words_path = None
         try:
-            if self.auto_crop:
-                self.status_update.emit(f"Анализ черных полос: {base_name}")
-                crop_filter = detect_crop_dimensions(in_file_path)
-
             if subtitle_mode == "whisper":
                 temp_dir = tempfile.gettempdir()
                 temp_audio_path = os.path.join(temp_dir, f"{uuid.uuid4()}.wav")
@@ -194,7 +192,7 @@ class Worker(QThread):
 
                 with self._whisper_lock:
                     if not self._is_running:
-                        return
+                        return None
                     self.status_update.emit(f"Распознавание речи: {base_name}")
                     generate_words_from_whisper(
                         audio_path=temp_audio_path,
@@ -217,6 +215,56 @@ class Worker(QThread):
             if caption_lines:
                 caption_lines = apply_fixes(caption_lines,
                                             parse_fixes(self.subtitle_settings.get("fixes", "")))
+            return caption_lines
+        finally:
+            for path in (temp_audio_path, words_path):
+                if path and os.path.exists(path):
+                    os.remove(path)
+
+    def _prepare_for_review(self, in_file_path):
+        if not self._is_running:
+            return
+        base_name = os.path.basename(in_file_path)
+        self._set_active(base_name, True)
+        try:
+            self._prepared[in_file_path] = self._prepare_captions(in_file_path, base_name) or []
+        except Exception as e:
+            if not self._is_running:
+                return
+            message = f"Ошибка субтитров для '{base_name}':\n{type(e).__name__}: {e}"
+            with self._lock:
+                self.errors.append(message)
+                self._failed.add(in_file_path)
+            self.error.emit(message)
+        finally:
+            self._set_active(base_name, False)
+
+    def resume(self, captions):
+        """Ответ окна проверки: исправленные строки или None — отмена."""
+        self._reviewed = captions
+        self._review_event.set()
+
+    def _process_one(self, index, in_file_path):
+        if not self._is_running:
+            return
+        base_name = os.path.basename(in_file_path)
+        out_file_path = self._output_path(in_file_path)
+        trim_start, trim_end = self.trims.get(in_file_path, (0.0, None))
+
+        self._set_active(base_name, True)
+        crop_filter = None
+
+        try:
+            if self.auto_crop:
+                self.status_update.emit(f"Анализ черных полос: {base_name}")
+                crop_filter = detect_crop_dimensions(in_file_path)
+
+            if in_file_path in self._prepared:
+                caption_lines = self._prepared[in_file_path]
+            else:
+                caption_lines = self._prepare_captions(in_file_path, base_name)
+            if not self._is_running:
+                return
 
             process_single(
                 in_path=in_file_path,
@@ -272,10 +320,6 @@ class Worker(QThread):
 
         finally:
             self._set_active(base_name, False)
-            if temp_audio_path and os.path.exists(temp_audio_path):
-                os.remove(temp_audio_path)
-            if words_path and os.path.exists(words_path):
-                os.remove(words_path)
 
     def run(self):
         total_files = len(self.files)
@@ -292,9 +336,30 @@ class Worker(QThread):
             self.finished.emit()
             return
 
-        with ThreadPoolExecutor(max_workers=min(self.parallel, total_files)) as pool:
+        workers = min(self.parallel, total_files)
+        has_subtitles = self.subtitle_settings.get("mode") in ("whisper", "srt_file")
+        if self.review_subtitles and has_subtitles:
+            # Сначала субтитры для всех файлов, затем пауза на проверку и
+            # только потом рендер: править текст, пока видео уже кодируется,
+            # было бы поздно.
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for path in self.files:
+                    pool.submit(self._prepare_for_review, path)
+            ready = {p: self._prepared[p] for p in self.files if p in self._prepared}
+            if self._is_running and ready:
+                self.status_update.emit("Проверка субтитров...")
+                self.captions_ready.emit(ready)
+                self._review_event.wait()
+                if self._reviewed is None and self._is_running:
+                    self.cancelled_at_review = True
+                    self._is_running = False
+                elif self._reviewed is not None:
+                    self._prepared.update(self._reviewed)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             for index, path in enumerate(self.files):
-                pool.submit(self._process_one, index, path)
+                if path not in self._failed:
+                    pool.submit(self._process_one, index, path)
 
         if self._is_running:
             print("Worker finished processing all files.")

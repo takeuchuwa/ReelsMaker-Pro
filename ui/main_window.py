@@ -32,6 +32,7 @@ from utils.ffmpeg_utils import (generate_preview, get_video_duration, detect_cro
 from utils.path_utils import resource_path
 from utils import links
 from ui.image_viewer import ImageViewerDialog
+from ui.subtitle_review import SubtitleReviewDialog
 from ui.player import PlayerPanel
 from utils.timecode import format_timecode
 from utils.captions import MODE_STATIC, MODE_APPEAR, MODE_HIGHLIGHT
@@ -751,6 +752,13 @@ class ProcessingWidgetContent(QWidget):
         subs_whisper_layout.addLayout(whisper_row4)
         subs_main_layout.addWidget(self.subs_whisper_widget)
 
+        self.subs_skip_review_cb = QCheckBox("Без проверки субтитров")
+        self.subs_skip_review_cb.setChecked(True)
+        self.subs_skip_review_cb.setToolTip(
+            "Снимите, чтобы после распознавания открылось окно с текстом:\n"
+            "его можно поправить и прослушать, и только потом начнётся рендер.")
+        subs_main_layout.addWidget(self.subs_skip_review_cb)
+
         common_style_layout = QHBoxLayout()
         common_style_layout.addWidget(QLabel("Размер (pt):"))
         self.subs_size_spin = QSpinBox()
@@ -932,6 +940,7 @@ class ProcessingWidgetContent(QWidget):
         self.subs_anim_combo.currentIndexChanged.connect(self.on_subs_anim_changed)
         self.subs_size_spin.valueChanged.connect(self.save_subtitle_settings)
         self.subs_outline_spin.valueChanged.connect(self.save_subtitle_settings)
+        self.subs_skip_review_cb.toggled.connect(self.save_subtitle_settings)
         self.subs_hints_edit.editingFinished.connect(self.save_subtitle_settings)
         self.subs_fixes_edit.textChanged.connect(self.save_subtitle_settings)
         self.subs_font_combo.currentFontChanged.connect(self.save_subtitle_settings)
@@ -985,6 +994,7 @@ class ProcessingWidgetContent(QWidget):
             self.subs_color_btn.set_color(st.value("subtitles/color", "#FFFFFF"))
             self.subs_outline_btn.set_color(st.value("subtitles/outline_color", "#000000"))
             self.subs_outline_spin.setValue(float(st.value("subtitles/outline_width", 2)))
+            self.subs_skip_review_cb.setChecked(st.value("subtitles/skip_review", "true") in (True, "true"))
             self.subs_highlight_btn.set_color(st.value("subtitles/highlight_color", "#FFD400"))
             index = self.subs_anim_combo.findData(st.value("subtitles/mode", MODE_STATIC))
             self.subs_anim_combo.setCurrentIndex(max(0, index))
@@ -1004,6 +1014,7 @@ class ProcessingWidgetContent(QWidget):
         st.setValue("subtitles/color", style["color"])
         st.setValue("subtitles/outline_color", style["outline_color"])
         st.setValue("subtitles/outline_width", style["outline_width"])
+        st.setValue("subtitles/skip_review", self.subs_skip_review_cb.isChecked())
         st.setValue("subtitles/highlight_color", style["highlight_color"])
         st.setValue("subtitles/mode", style["mode"])
         st.setValue("subtitles/hints", self.subs_hints_edit.text())
@@ -1412,6 +1423,7 @@ class ProcessingWidgetContent(QWidget):
             },
             trims=trims,
             parallel=self.parallel_spin.value(),
+            review_subtitles=not self.subs_skip_review_cb.isChecked(),
         )
 
         self.processing_thread.progress.connect(self.on_prog)
@@ -1420,6 +1432,7 @@ class ProcessingWidgetContent(QWidget):
         self.processing_thread.error.connect(self.on_err)
         self.processing_thread.file_processing.connect(self.on_file_processing)
         self.processing_thread.status_update.connect(self.on_status_update)
+        self.processing_thread.captions_ready.connect(self.on_captions_ready)
 
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("%p%")
@@ -1458,7 +1471,10 @@ class ProcessingWidgetContent(QWidget):
         # иначе объект QThread мог бы удалиться, пока поток ещё жив.
         thread.wait(3000)
         total, ok, errors = len(thread.files), len(thread.output_paths), thread.errors
-        if thread.is_stopped():
+        if thread.cancelled_at_review:
+            status = "Обработка отменена на проверке субтитров"
+            QMessageBox.information(self, "Отменено", status)
+        elif thread.is_stopped():
             status = f"Остановлено: готово {ok} из {total}"
             QMessageBox.information(self, "Остановлено", status)
         elif errors:
@@ -1471,6 +1487,23 @@ class ProcessingWidgetContent(QWidget):
             status = f"Готово: {ok} из {total}"
             QMessageBox.information(self, "Готово", "Обработка успешно завершена!")
         self.status_label.setText(status)
+
+    def on_captions_ready(self, captions):
+        thread = self.processing_thread
+        if thread is None:
+            return
+        dialog = SubtitleReviewDialog(captions, self.play_caption, self)
+        accepted = dialog.exec_() == QDialog.Accepted
+        thread.resume(dialog.result_captions() if accepted else None)
+        if accepted:
+            self.status_label.setText("Рендер...")
+
+    def play_caption(self, path, start, end):
+        """Прослушать строку из окна проверки в плеере главного окна."""
+        item = self._item_for_path(path)
+        if item is not None and self.video_list_widget.currentItem() is not item:
+            self.video_list_widget.setCurrentItem(item)
+        self.player_panel.play_segment(start, end)
 
     def on_err(self, msg):
         # Ошибка одного файла не останавливает партию: остальные продолжают
