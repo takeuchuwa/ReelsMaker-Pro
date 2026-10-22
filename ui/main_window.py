@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import logging
 
-from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QThread
+from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QThread, QSettings
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QIcon, QPixmap
 from PyQt5.QtWidgets import QColorDialog
 from PyQt5.QtWidgets import (
@@ -34,6 +34,7 @@ from utils import links
 from ui.subtitle_preview_dialog import SubtitlePreviewDialog
 from ui.player import PlayerPanel
 from utils.timecode import format_timecode
+from utils.captions import MODE_STATIC, MODE_APPEAR, MODE_HIGHLIGHT
 
 # Отрезок видео в элементе списка: (начало, конец или None) либо None — весь ролик.
 TRIM_ROLE = Qt.UserRole + 1
@@ -718,6 +719,15 @@ class ProcessingWidgetContent(QWidget):
         whisper_row3.addWidget(self.subs_words_spin)
         whisper_row3.addStretch()
         subs_whisper_layout.addLayout(whisper_row3)
+        whisper_row4 = QHBoxLayout()
+        whisper_row4.addWidget(QLabel("Подсказка:"))
+        self.subs_hints_edit = QLineEdit()
+        self.subs_hints_edit.setPlaceholderText("Имена и термины: Поздняков, Open Wheel League")
+        self.subs_hints_edit.setToolTip(
+            "Слова, которые модель должна узнавать. Помогает с фамилиями и\n"
+            "названиями, но не гарантирует — для верности добавьте автозамену.")
+        whisper_row4.addWidget(self.subs_hints_edit, 1)
+        subs_whisper_layout.addLayout(whisper_row4)
         subs_main_layout.addWidget(self.subs_whisper_widget)
 
         common_style_layout = QHBoxLayout()
@@ -734,6 +744,33 @@ class ProcessingWidgetContent(QWidget):
         self.subs_outline_btn = self._make_color_button("Обводка", "#000000")
         common_style_layout.addWidget(self.subs_color_btn)
         common_style_layout.addWidget(self.subs_outline_btn)
+
+        anim_layout = QHBoxLayout()
+        anim_layout.addWidget(QLabel("Анимация:"))
+        self.subs_anim_combo = QComboBox()
+        self.subs_anim_combo.addItem("Обычные строки", MODE_STATIC)
+        self.subs_anim_combo.addItem("Появление слов", MODE_APPEAR)
+        self.subs_anim_combo.addItem("Подсветка слова", MODE_HIGHLIGHT)
+        self.subs_anim_combo.setToolTip(
+            "Появление — слова проявляются по мере речи.\n"
+            "Подсветка — строка видна целиком, звучащее слово выделено цветом.\n\n"
+            "Точное время слов есть у распознанных субтитров; для файла SRT оно\n"
+            "раскладывается по длине слов внутри строки.")
+        anim_layout.addWidget(self.subs_anim_combo, 1)
+        self.subs_highlight_btn = self._make_color_button("Выделение", "#FFD400")
+        anim_layout.addWidget(self.subs_highlight_btn)
+        subs_main_layout.addLayout(anim_layout)
+
+        fixes_label = QLabel("Автозамены (по строке «было = стало»):")
+        fixes_label.setToolTip(
+            "Применяются после распознавания и к файлам SRT.\n"
+            "Регистр «было» не важен. Однословные правила ловят и падежи:\n"
+            "«Позняков = Поздняков» исправит и «Познякова» на «Позднякова».")
+        subs_main_layout.addWidget(fixes_label)
+        self.subs_fixes_edit = QPlainTextEdit()
+        self.subs_fixes_edit.setPlaceholderText("Позняков = Поздняков")
+        self.subs_fixes_edit.setFixedHeight(70)
+        subs_main_layout.addWidget(self.subs_fixes_edit)
 
         self.subs_preview_btn = QPushButton("Предпросмотр стиля")
         self.subs_preview_btn.clicked.connect(self.on_subtitle_preview)
@@ -857,6 +894,11 @@ class ProcessingWidgetContent(QWidget):
         self.player_panel.apply_to_all.connect(self.on_trim_apply_all)
 
         self.on_subs_mode_changed()
+        self.load_subtitle_settings()
+        self.subs_anim_combo.currentIndexChanged.connect(self.on_subs_anim_changed)
+        self.subs_size_spin.valueChanged.connect(self.save_subtitle_settings)
+        self.subs_hints_edit.editingFinished.connect(self.save_subtitle_settings)
+        self.subs_fixes_edit.textChanged.connect(self.save_subtitle_settings)
         self.on_output_format_changed(self.output_format_combo.currentText())
         self.on_zoom_mode_changed()
         self.on_speed_mode_changed()
@@ -878,6 +920,7 @@ class ProcessingWidgetContent(QWidget):
             chosen = QColorDialog.getColor(QColor(btn.property("color_value")), self, title)
             if chosen.isValid():
                 show(chosen.name())
+                self.save_subtitle_settings()
 
         btn.set_color = show
         btn.clicked.connect(pick)
@@ -889,7 +932,47 @@ class ProcessingWidgetContent(QWidget):
             "font_size": self.subs_size_spin.value(),
             "color": self.subs_color_btn.property("color_value"),
             "outline_color": self.subs_outline_btn.property("color_value"),
+            "highlight_color": self.subs_highlight_btn.property("color_value"),
+            "mode": self.subs_anim_combo.currentData(),
         }
+
+    # Словарь автозамен и оформление копятся от ролика к ролику: набирать их
+    # заново при каждом запуске никто не будет.
+    def _settings(self):
+        return QSettings("ReelsMakerPro", "ReelsMakerPro")
+
+    def load_subtitle_settings(self):
+        st = self._settings()
+        self._loading_settings = True
+        try:
+            self.subs_size_spin.setValue(int(st.value("subtitles/size", 12)))
+            self.subs_color_btn.set_color(st.value("subtitles/color", "#FFFFFF"))
+            self.subs_outline_btn.set_color(st.value("subtitles/outline_color", "#000000"))
+            self.subs_highlight_btn.set_color(st.value("subtitles/highlight_color", "#FFD400"))
+            index = self.subs_anim_combo.findData(st.value("subtitles/mode", MODE_STATIC))
+            self.subs_anim_combo.setCurrentIndex(max(0, index))
+            self.subs_hints_edit.setText(st.value("subtitles/hints", ""))
+            self.subs_fixes_edit.setPlainText(st.value("subtitles/fixes", ""))
+        finally:
+            self._loading_settings = False
+        self.on_subs_anim_changed()
+
+    def save_subtitle_settings(self):
+        if getattr(self, "_loading_settings", False):
+            return
+        st = self._settings()
+        style = self.subtitle_style()
+        st.setValue("subtitles/size", style["font_size"])
+        st.setValue("subtitles/color", style["color"])
+        st.setValue("subtitles/outline_color", style["outline_color"])
+        st.setValue("subtitles/highlight_color", style["highlight_color"])
+        st.setValue("subtitles/mode", style["mode"])
+        st.setValue("subtitles/hints", self.subs_hints_edit.text())
+        st.setValue("subtitles/fixes", self.subs_fixes_edit.toPlainText())
+
+    def on_subs_anim_changed(self):
+        self.subs_highlight_btn.setEnabled(self.subs_anim_combo.currentData() == MODE_HIGHLIGHT)
+        self.save_subtitle_settings()
 
     def update_preview_btn_state(self):
         is_file_mode = self.subs_from_file_radio.isChecked()
@@ -1256,8 +1339,10 @@ class ProcessingWidgetContent(QWidget):
             subtitle_settings["model"] = self.subs_model_combo.currentText()
             subtitle_settings["language"] = self.subs_lang_combo.currentText()
             subtitle_settings["words_per_line"] = self.subs_words_spin.value()
+            subtitle_settings["hints"] = self.subs_hints_edit.text().strip()
 
         subtitle_settings["style"] = self.subtitle_style()
+        subtitle_settings["fixes"] = self.subs_fixes_edit.toPlainText()
 
         self.processing_thread = Worker(
             files=video_files,
@@ -1390,6 +1475,7 @@ class ProcessingWidgetContent(QWidget):
             self.subs_size_spin.setValue(style.get('size', 12))
             self.subs_color_btn.set_color(style.get('color', '#FFFFFF'))
             self.subs_outline_btn.set_color(style.get('outline_color', '#000000'))
+            self.save_subtitle_settings()
 
 
 class VideoUnicApp(QMainWindow):

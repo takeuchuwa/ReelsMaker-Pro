@@ -20,7 +20,6 @@ from .constants import (
     PRESETS_DIR, VIDEO_EXTENSIONS
 )
 from .path_utils import resource_path
-from .srt_shift import shift_srt_to_temp
 
 logger = logging.getLogger(__name__)
 
@@ -479,7 +478,7 @@ def process_single(
         mute_audio: bool = False,
         strip_metadata: bool = False,
         codec: str = "libx264",
-        srt_path: Optional[str] = None,
+        caption_lines: Optional[list] = None,
         subtitle_style: Optional[Dict] = None,
         crop_filter: Optional[str] = None,
         overlay_audio_path: Optional[str] = None,
@@ -493,10 +492,9 @@ def process_single(
         progress_callback: Optional[Callable[[int], None]] = None,
         trim_start: float = 0.0,
         trim_end: Optional[float] = None,
-        srt_origin: float = 0.0,
 ):
-    """srt_origin — с какой секунды исходника отсчитаны субтитры: 0 для файла
-    SRT и начало отрезка для распознанных по вырезанному звуку."""
+    """caption_lines — строки субтитров из слов со временем исходника; сюда они
+    приходят уже с автозаменами, сдвиг под отрезок делается здесь."""
     is_gif_input = in_path.lower().endswith('.gif')
     # Значения разыгрываются на каждый файл заново. Постоянный набор правок
     # сам становится приметой: по ней вычисляли партии роликов из телеграм-ботов.
@@ -633,41 +631,18 @@ def process_single(
                 f"{last_video_node}scale=iw*{zoom_factor}:ih*{zoom_factor}:flags=bicubic{scale_node}")
             last_video_node = scale_node
 
-    shifted_srt = None
-    if srt_path and subtitle_style and abs(seek - srt_origin) > 0.0005:
-        shifted_srt = shift_srt_to_temp(srt_path, seek - srt_origin)
-        srt_path = shifted_srt
-
-    if srt_path and subtitle_style:
-        sanitized_srt_path = srt_path.replace('\\', '/').replace(':', '\\:')
-        font_size = subtitle_style.get("font_size", 12)
-        primary = ass_color(subtitle_style.get("color"), "#FFFFFF")
-        outline = ass_color(subtitle_style.get("outline_color"), "#000000")
-
-        position_code = 2
-        vertical_margin = 70
-
-        style_params = [
-            f"Alignment={position_code}",
-            f"MarginL=25",
-            f"MarginR=25",
-            f"MarginV={vertical_margin}",
-            "FontName=Arial",
-            f"FontSize={font_size}",
-            f"PrimaryColour={primary}",
-            "BorderStyle=1",
-            f"OutlineColour={outline}",
-            "Outline=2",
-            "Shadow=1"
-        ]
-
-        style_string = r'\,'.join(style_params)
-
-        new_node_label = f"[v{node_idx}]";
-        node_idx += 1
-        filter_complex_parts.append(
-            f"{last_video_node}subtitles='{sanitized_srt_path}':force_style='{style_string}'{new_node_label}")
-        last_video_node = new_node_label
+    subs_file = None
+    if caption_lines and subtitle_style:
+        from .captions import shift_lines, write_ass_temp
+        # Ноль результата — секунда seek исходника: всё, что раньше, обрезано.
+        lines = shift_lines(caption_lines, seek, keep)
+        if lines:
+            subs_file = write_ass_temp(lines, subtitle_style, subtitle_style.get("mode", "static"))
+            sanitized = subs_file.replace('\\', '/').replace(':', '\\:')
+            new_node_label = f"[v{node_idx}]"
+            node_idx += 1
+            filter_complex_parts.append(f"{last_video_node}subtitles='{sanitized}'{new_node_label}")
+            last_video_node = new_node_label
 
     speed_factor = speed_p / 100.0
     if unique and abs(unique['speed'] - 1.0) > 1e-6 and abs(speed_factor - 1.0) <= 1e-5:
@@ -769,8 +744,8 @@ def process_single(
         run_ffmpeg(final_cmd, input_file_for_log=in_path, duration=duration,
                    progress_callback=progress_callback)
     finally:
-        if shifted_srt and os.path.exists(shifted_srt):
-            os.remove(shifted_srt)
+        if subs_file and os.path.exists(subs_file):
+            os.remove(subs_file)
 
 
 def generate_preview(

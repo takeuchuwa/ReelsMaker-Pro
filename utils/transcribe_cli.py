@@ -6,9 +6,10 @@
 библиотек не наследует.
 
 Здесь нельзя импортировать PyQt5 — ни прямо, ни через utils. Прогресс идёт в
-stderr строками «PROGRESS n», готовый SRT пишется в файл.
+stderr строками «PROGRESS n», слова со временем пишутся в JSON.
 """
 import argparse
+import json
 import os
 import sys
 
@@ -24,12 +25,6 @@ LANGUAGE_CODES = {
 def _emit(kind, value):
     print('%s %s' % (kind, value), file=sys.stderr, flush=True)
 
-
-def _format_time(seconds):
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    ms = int((s - int(s)) * 1000)
-    return '%02d:%02d:%02d,%03d' % (int(h), int(m), int(s), ms)
 
 
 def _read_wav(path):
@@ -65,31 +60,28 @@ def run(args):
         language = LANGUAGE_CODES.get(args.language.lower(), args.language.lower())
 
     _emit('STAGE', 'transcribing')
+    # Подсказка с именами и терминами: модель охотнее выбирает их написание,
+    # когда звук неоднозначен («Поздняков», а не «Позняков»).
     segments, info = model.transcribe(_read_wav(args.audio), language=language,
-                                      word_timestamps=True)
+                                      word_timestamps=True,
+                                      hotwords=args.hints or None)
 
     total = getattr(info, 'duration', 0) or 0
-    lines = []
-    index = 1
+    words = []
     # segments — генератор: распознавание идёт по мере обхода, поэтому прогресс
-    # отдаём прямо здесь.
+    # отдаём прямо здесь. Строки собирает уже основной процесс: ему нужны
+    # отдельные слова со временем для анимации и автозамен.
     for segment in segments:
-        words = getattr(segment, 'words', None)
-        if not words:
-            continue
-        for start in range(0, len(words), args.words_per_line):
-            chunk = words[start:start + args.words_per_line]
-            if not chunk:
-                continue
-            text = ' '.join(word.word.strip() for word in chunk).strip()
-            lines.append('%d\n%s --> %s\n%s\n\n' % (
-                index, _format_time(chunk[0].start), _format_time(chunk[-1].end), text))
-            index += 1
+        for word in getattr(segment, 'words', None) or []:
+            text = word.word.strip()
+            if text:
+                words.append({'word': text, 'start': round(word.start, 3),
+                              'end': round(word.end, 3)})
         if total > 0:
             _emit('PROGRESS', min(99, int(segment.end / total * 100)))
 
-    with open(args.srt, 'w', encoding='utf-8') as handle:
-        handle.write(''.join(lines))
+    with open(args.json, 'w', encoding='utf-8') as handle:
+        json.dump({'words': words}, handle, ensure_ascii=False)
     _emit('PROGRESS', 100)
     return 0
 
@@ -98,10 +90,10 @@ def main(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument(WORKER_FLAG, action='store_true', dest='worker')
     parser.add_argument('--audio', required=True)
-    parser.add_argument('--srt', required=True)
+    parser.add_argument('--json', required=True)
     parser.add_argument('--model', default='base')
     parser.add_argument('--language', default='')
-    parser.add_argument('--words-per-line', type=int, default=5, dest='words_per_line')
+    parser.add_argument('--hints', default='')
     args = parser.parse_args(argv)
     try:
         return run(args)

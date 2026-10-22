@@ -49,15 +49,15 @@ def _format_time(seconds):
     return f"{int(h):02}:{int(m):02}:{int(s):02},{ms:03}"
 
 
-def _worker_command(audio_path, srt_path, model_name, language, words_per_line):
+def _worker_command(audio_path, json_path, model_name, language, hints):
     """Как запустить дочерний процесс — из сборки или из исходников."""
     arguments = [
         WORKER_FLAG,
         '--audio', audio_path,
-        '--srt', srt_path,
+        '--json', json_path,
         '--model', model_name,
         '--language', language or '',
-        '--words-per-line', str(words_per_line),
+        '--hints', hints or '',
     ]
     if getattr(sys, 'frozen', False):
         # Отдельный исполняемый файл со своим набором библиотек. Перезапускать
@@ -70,21 +70,21 @@ def _worker_command(audio_path, srt_path, model_name, language, words_per_line):
     return [sys.executable, entry] + arguments
 
 
-def generate_srt_from_whisper(
+def generate_words_from_whisper(
         audio_path: str,
-        srt_path: str,
+        json_path: str,
         model_name: str,
         language: str,
-        words_per_line: int,
+        hints: str = "",
         progress_callback: Optional[Callable[[int], None]] = None,
 ):
-    """Распознаёт речь и пишет SRT.
+    """Распознаёт речь и пишет слова со временем в JSON.
 
     Работа идёт в отдельном процессе: Qt и ctranslate2 конфликтуют при загрузке
     нативных библиотек, и в одном процессе с интерфейсом обращение к модели
     роняет программу без единого сообщения.
     """
-    command = _worker_command(audio_path, srt_path, model_name, language, words_per_line)
+    command = _worker_command(audio_path, json_path, model_name, language, hints)
 
     creationflags = 0
     if platform.system() == 'Windows':
@@ -128,5 +128,5 @@ def generate_srt_from_whisper(
             'Не удалось распознать речь. При первом запуске модель скачивается '
             'из интернета. Ошибка: %s' % (failure or 'код возврата %d' % code))
 
-    logger.info(f"SRT file saved to {srt_path}")
-    return srt_path
+    logger.info(f"Words saved to {json_path}")
+    return json_path

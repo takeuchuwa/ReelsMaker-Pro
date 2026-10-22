@@ -11,7 +11,9 @@ from typing import List, Optional, Dict, Tuple
 from utils.ffmpeg_utils import (process_single, detect_crop_dimensions, pick_random_filler,
                                 plan_input_window, get_video_duration, terminate_all_ffmpeg)
 from utils.constants import RANDOM_FILLER
-from utils.subtitle_utils import extract_audio, generate_srt_from_whisper
+from utils.subtitle_utils import extract_audio, generate_words_from_whisper
+from utils.captions import (load_whisper_words, group_words, load_srt_lines,
+                            parse_fixes, apply_fixes)
 
 
 class Worker(QThread):
@@ -169,11 +171,11 @@ class Worker(QThread):
         trim_start, trim_end = self.trims.get(in_file_path, (0.0, None))
 
         self._set_active(base_name, True)
-        srt_path = None
+        words_path = None
         temp_audio_path = None
         crop_filter = None
+        caption_lines = None
         subtitle_mode = self.subtitle_settings.get("mode")
-        srt_origin = 0.0
 
         try:
             if self.auto_crop:
@@ -183,31 +185,38 @@ class Worker(QThread):
             if subtitle_mode == "whisper":
                 temp_dir = tempfile.gettempdir()
                 temp_audio_path = os.path.join(temp_dir, f"{uuid.uuid4()}.wav")
-                srt_path = os.path.join(temp_dir, f"{uuid.uuid4()}.srt")
+                words_path = os.path.join(temp_dir, f"{uuid.uuid4()}.json")
 
                 start, span = plan_input_window(
                     get_video_duration(in_file_path), trim_start, trim_end, None)
                 self.status_update.emit(f"Извлечение аудио из '{base_name}'...")
                 extract_audio(in_file_path, temp_audio_path, start, span)
-                srt_origin = start
 
                 with self._whisper_lock:
                     if not self._is_running:
                         return
                     self.status_update.emit(f"Распознавание речи: {base_name}")
-                    generate_srt_from_whisper(
+                    generate_words_from_whisper(
                         audio_path=temp_audio_path,
-                        srt_path=srt_path,
+                        json_path=words_path,
                         model_name=self.subtitle_settings.get("model"),
                         language=self.subtitle_settings.get("language"),
-                        words_per_line=self.subtitle_settings.get("words_per_line"),
+                        hints=self.subtitle_settings.get("hints", ""),
                         progress_callback=lambda p: self.status_update.emit(
                             f"Распознавание речи: {base_name} — {p}%")
                     )
+                # Звук вырезан с секунды start: возвращаем словам время исходника.
+                caption_lines = group_words(load_whisper_words(words_path, start),
+                                            self.subtitle_settings.get("words_per_line", 4))
             elif subtitle_mode == "srt_file":
                 srt_path = self.subtitle_settings.get("srt_path")
                 if not srt_path or not os.path.exists(srt_path):
                     raise FileNotFoundError(f"Файл субтитров не найден: {srt_path}")
+                caption_lines = load_srt_lines(srt_path)
+
+            if caption_lines:
+                caption_lines = apply_fixes(caption_lines,
+                                            parse_fixes(self.subtitle_settings.get("fixes", "")))
 
             process_single(
                 in_path=in_file_path,
@@ -222,7 +231,7 @@ class Worker(QThread):
                 mute_audio=self.mute_audio,
                 strip_metadata=self.strip_metadata,
                 codec=self.codec,
-                srt_path=srt_path,
+                caption_lines=caption_lines,
                 subtitle_style=self.subtitle_settings.get("style", {}),
                 crop_filter=crop_filter,
                 overlay_audio_path=self.overlay_audio,
@@ -238,7 +247,6 @@ class Worker(QThread):
                 progress_callback=lambda p: self._report_progress(index, p),
                 trim_start=trim_start,
                 trim_end=trim_end,
-                srt_origin=srt_origin,
             )
             with self._lock:
                 self.output_paths.append(out_file_path)
@@ -266,8 +274,8 @@ class Worker(QThread):
             self._set_active(base_name, False)
             if temp_audio_path and os.path.exists(temp_audio_path):
                 os.remove(temp_audio_path)
-            if srt_path and subtitle_mode == "whisper" and os.path.exists(srt_path):
-                os.remove(srt_path)
+            if words_path and os.path.exists(words_path):
+                os.remove(words_path)
 
     def run(self):
         total_files = len(self.files)
