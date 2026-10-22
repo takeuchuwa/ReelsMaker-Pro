@@ -762,7 +762,9 @@ def generate_preview(
         split_content_height: int = 1080,
         content_on_top: bool = True,
         at_time: Optional[float] = None,
+        subtitle_style: Optional[Dict] = None,
 ):
+    """subtitle_style — показать на кадре строку-образец субтитров этим стилем."""
     is_gif_input = in_path.lower().endswith('.gif')
     if at_time is not None:
         mid_point = 0 if is_gif_input else max(0.0, at_time)
@@ -860,6 +862,15 @@ def generate_preview(
             filter_complex_parts.append(
                 f"{last_video_node}scale=iw*{zoom_factor}:ih*{zoom_factor}:flags=bicubic{scale_node}")
             last_video_node = scale_node
+    subs_file = None
+    if subtitle_style:
+        from .captions import build_preview_ass, write_text_temp
+        subs_file = write_text_temp(build_preview_ass(subtitle_style))
+        sanitized = subs_file.replace('\\', '/').replace(':', '\\:')
+        new_node_label = f"[v{node_idx}]"
+        node_idx += 1
+        filter_complex_parts.append(f"{last_video_node}subtitles='{sanitized}'{new_node_label}")
+        last_video_node = new_node_label
     if overlay_stream_label:
         pos_params = OVERLAY_POSITIONS.get(overlay_pos, "x=(W-w)/2:y=(H-h)/2")
         alpha_node = f"[ovl{node_idx}]";
@@ -876,4 +887,8 @@ def generate_preview(
         cmd.extend(["-map", "[vout]"])
     cmd.extend(["-vframes", "1"])
     cmd.append(out_path)
-    run_ffmpeg(cmd, input_file_for_log=in_path)
+    try:
+        run_ffmpeg(cmd, input_file_for_log=in_path)
+    finally:
+        if subs_file and os.path.exists(subs_file):
+            os.remove(subs_file)

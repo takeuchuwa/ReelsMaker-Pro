@@ -208,6 +208,7 @@ def build_ass(lines: List[Line], style: dict, mode: str) -> str:
     outline = ass_color(style.get("outline_color"), "#000000")
     highlight = ass_color(style.get("highlight_color"), "#FFD400")
     size = style.get("font_size", 12)
+    font = (style.get("font") or "Arial").replace(",", " ")
     # 384x288 — то же поле, в которое ffmpeg переводит SRT: размеры и отступы
     # значат ровно то же, что и раньше.
     header = (
@@ -217,7 +218,7 @@ def build_ass(lines: List[Line], style: dict, mode: str) -> str:
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
         "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,Arial,{size},{primary},{primary},{outline},&H80000000,"
+        f"Style: Default,{font},{size},{primary},{primary},{outline},&H80000000,"
         "0,0,0,0,100,100,0,0,1,2,1,2,25,25,70,1\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
     events = []
@@ -254,8 +255,27 @@ def build_ass(lines: List[Line], style: dict, mode: str) -> str:
     return header + "\n".join(events) + "\n"
 
 
-def write_ass_temp(lines: List[Line], style: dict, mode: str) -> str:
-    handle, path = tempfile.mkstemp(prefix="reels_subs_", suffix=".ass")
+PREVIEW_TEXT = "Так виглядатимуть ваші субтитри"
+
+
+def build_preview_ass(style: dict, text: str = PREVIEW_TEXT) -> str:
+    """Одна строка-образец на весь кадр предпросмотра. В режиме подсветки
+    выделено второе слово — иначе цвет выделения было бы не увидеть."""
+    from .ffmpeg_utils import ass_color
+    texts = [_ass_text(w) for w in text.split()]
+    if style.get("mode") == MODE_HIGHLIGHT and len(texts) > 1:
+        highlight = ass_color(style.get("highlight_color"), "#FFD400")
+        texts[1] = r"{\1c" + highlight + "&}" + texts[1] + r"{\r}"
+    header = build_ass([], style, MODE_STATIC)
+    return header + f"Dialogue: 0,0:00:00.00,9:00:00.00,Default,,0,0,0,,{' '.join(texts)}\n"
+
+
+def write_text_temp(content: str, suffix: str = ".ass") -> str:
+    handle, path = tempfile.mkstemp(prefix="reels_subs_", suffix=suffix)
     with os.fdopen(handle, "w", encoding="utf-8") as f:
-        f.write(build_ass(lines, style, mode))
+        f.write(content)
     return path
+
+
+def write_ass_temp(lines: List[Line], style: dict, mode: str) -> str:
+    return write_text_temp(build_ass(lines, style, mode))

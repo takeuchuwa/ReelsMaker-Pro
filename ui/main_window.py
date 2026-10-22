@@ -7,9 +7,9 @@ import shutil
 import subprocess
 import logging
 
-from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QThread, QSettings
+from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QThread, QSettings, QTimer
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QIcon, QPixmap
-from PyQt5.QtWidgets import QColorDialog
+from PyQt5.QtWidgets import QColorDialog, QFontComboBox
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QListWidget, QAbstractItemView, QFileDialog, QSpinBox,
@@ -31,7 +31,7 @@ from utils.ffmpeg_utils import (generate_preview, get_video_duration, detect_cro
                                 user_presets_dir)
 from utils.path_utils import resource_path
 from utils import links
-from ui.subtitle_preview_dialog import SubtitlePreviewDialog
+from ui.image_viewer import ImageViewerDialog
 from ui.player import PlayerPanel
 from utils.timecode import format_timecode
 from utils.captions import MODE_STATIC, MODE_APPEAR, MODE_HIGHLIGHT
@@ -285,6 +285,9 @@ class ProcessingWidgetContent(QWidget):
 
         add_scrollable_tab(main_tab, "Меню")
         add_scrollable_tab(transform_tab, "Трансформация")
+        # Разделение экрана нужно изредка: на первой вкладке оставлено частое —
+        # формат, субтитры и предпросмотр.
+        add_scrollable_tab(effects_tab, "Залипалка")
         # Вкладка «Наложение» убрана: разделение экрана и субтитры переехали на
         # первую, а баннер — к трансформациям.
         add_scrollable_tab(audio_tab, "Аудио")
@@ -371,7 +374,11 @@ class ProcessingWidgetContent(QWidget):
         self.preview_label = QLabel("Выберите видео и нажмите 'Обновить'")
         self.preview_label.setObjectName("previewLabel")
         self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumHeight(220)
+        self.preview_label.setMinimumHeight(320)
+        self.preview_label.setToolTip("Клик — открыть кадр крупно")
+        self.preview_label.setCursor(Qt.PointingHandCursor)
+        self.preview_label.mousePressEvent = lambda _e: self.open_preview_large()
+        self.last_preview_image = None
         preview_layout.addWidget(self.preview_label)
         self.preview_button = QPushButton("Обновить предпросмотр")
         preview_layout.addWidget(self.preview_button)
@@ -632,7 +639,8 @@ class ProcessingWidgetContent(QWidget):
         row_split_order.addWidget(self.split_pos_combo, 1)
         split_lay.addLayout(row_split_order)
 
-        main_tab_layout.addWidget(self.split_group)
+        effects_tab_layout.addWidget(self.split_group)
+        effects_tab_layout.addStretch()
 
         self.overlay_group = QGroupBox("Наложение (баннер)")
 
@@ -701,7 +709,7 @@ class ProcessingWidgetContent(QWidget):
         whisper_row1.addWidget(QLabel("Модель:"))
         self.subs_model_combo = QComboBox()
         self.subs_model_combo.addItems(WHISPER_MODELS)
-        self.subs_model_combo.setCurrentText("medium")
+        self.subs_model_combo.setCurrentText("turbo")
         self.subs_model_combo.setToolTip(
             "Размер при первом скачивании: small ~0.5 ГБ, medium ~1.5 ГБ,\n"
             "turbo ~1.6 ГБ, large ~3 ГБ. Больше — точнее, но медленнее.")
@@ -775,12 +783,17 @@ class ProcessingWidgetContent(QWidget):
         self.subs_fixes_edit.setFixedHeight(70)
         subs_main_layout.addWidget(self.subs_fixes_edit)
 
-        self.subs_preview_btn = QPushButton("Предпросмотр стиля")
-        self.subs_preview_btn.clicked.connect(self.on_subtitle_preview)
-        self.subs_preview_btn.setEnabled(False)
-        common_style_layout.addWidget(self.subs_preview_btn)
         common_style_layout.addStretch(1)
         subs_main_layout.addLayout(common_style_layout)
+
+        font_layout = QHBoxLayout()
+        font_layout.addWidget(QLabel("Шрифт:"))
+        # Список установленных шрифтов: субтитры рисует libass через
+        # fontconfig, ему доступно ровно то же, что видит система.
+        self.subs_font_combo = QFontComboBox()
+        self.subs_font_combo.setEditable(False)
+        font_layout.addWidget(self.subs_font_combo, 1)
+        subs_main_layout.addLayout(font_layout)
 
         main_tab_layout.addWidget(self.subs_group)
         main_tab_layout.addWidget(self.preview_group)
@@ -902,12 +915,20 @@ class ProcessingWidgetContent(QWidget):
         self.subs_size_spin.valueChanged.connect(self.save_subtitle_settings)
         self.subs_hints_edit.editingFinished.connect(self.save_subtitle_settings)
         self.subs_fixes_edit.textChanged.connect(self.save_subtitle_settings)
+        self.subs_font_combo.currentFontChanged.connect(self.save_subtitle_settings)
         self.on_output_format_changed(self.output_format_combo.currentText())
         self.on_zoom_mode_changed()
         self.on_speed_mode_changed()
         self.video_list_widget.files_dropped.connect(self.refresh_video_list_display)
-        self.subs_from_file_radio.toggled.connect(self.update_preview_btn_state)
-        self.subs_srt_path.textChanged.connect(self.update_preview_btn_state)
+        # Стиль субтитров виден на предпросмотре: после правки кадр
+        # перерисовывается сам, без нажатия «Обновить».
+        self.preview_refresh_timer = QTimer(self)
+        self.preview_refresh_timer.setSingleShot(True)
+        self.preview_refresh_timer.setInterval(450)
+        self.preview_refresh_timer.timeout.connect(self.refresh_preview_if_shown)
+        for signal in (self.subs_size_spin.valueChanged, self.subs_anim_combo.currentIndexChanged,
+                       self.subs_font_combo.currentFontChanged, self.subs_mode_group.buttonClicked):
+            signal.connect(lambda *_: self.preview_refresh_timer.start())
 
     def _make_color_button(self, title, initial):
         btn = QPushButton(title)
@@ -924,6 +945,7 @@ class ProcessingWidgetContent(QWidget):
             if chosen.isValid():
                 show(chosen.name())
                 self.save_subtitle_settings()
+                self.preview_refresh_timer.start()
 
         btn.set_color = show
         btn.clicked.connect(pick)
@@ -937,6 +959,7 @@ class ProcessingWidgetContent(QWidget):
             "outline_color": self.subs_outline_btn.property("color_value"),
             "highlight_color": self.subs_highlight_btn.property("color_value"),
             "mode": self.subs_anim_combo.currentData(),
+            "font": self.subs_font_combo.currentFont().family(),
         }
 
     # Словарь автозамен и оформление копятся от ролика к ролику: набирать их
@@ -956,6 +979,7 @@ class ProcessingWidgetContent(QWidget):
             self.subs_anim_combo.setCurrentIndex(max(0, index))
             self.subs_hints_edit.setText(st.value("subtitles/hints", ""))
             self.subs_fixes_edit.setPlainText(st.value("subtitles/fixes", ""))
+            self.subs_font_combo.setCurrentFont(QFont(st.value("subtitles/font", "Arial")))
         finally:
             self._loading_settings = False
         self.on_subs_anim_changed()
@@ -972,15 +996,11 @@ class ProcessingWidgetContent(QWidget):
         st.setValue("subtitles/mode", style["mode"])
         st.setValue("subtitles/hints", self.subs_hints_edit.text())
         st.setValue("subtitles/fixes", self.subs_fixes_edit.toPlainText())
+        st.setValue("subtitles/font", style["font"])
 
     def on_subs_anim_changed(self):
         self.subs_highlight_btn.setEnabled(self.subs_anim_combo.currentData() == MODE_HIGHLIGHT)
         self.save_subtitle_settings()
-
-    def update_preview_btn_state(self):
-        is_file_mode = self.subs_from_file_radio.isChecked()
-        has_srt = bool(self.subs_srt_path.text())
-        self.subs_preview_btn.setEnabled(is_file_mode and has_srt)
 
     def on_subs_mode_changed(self):
         is_from_file = self.subs_from_file_radio.isChecked()
@@ -1075,6 +1095,7 @@ class ProcessingWidgetContent(QWidget):
             'split_content_height': self.split_layout_combo.currentData(),
             'content_on_top': self.split_pos_combo.currentText() == SPLIT_CONTENT_TOP,
             'at_time': self._preview_time(selected_items[0]),
+            'subtitle_style': None if self.subs_off_radio.isChecked() else self.subtitle_style(),
         }
         self.set_controls_enabled(False)
         self.preview_label.setText("Генерация предпросмотра...")
@@ -1085,8 +1106,20 @@ class ProcessingWidgetContent(QWidget):
         self.preview_thread.error_signal.connect(self.on_preview_error)
         self.preview_thread.start()
 
+    def refresh_preview_if_shown(self):
+        """Перерисовать кадр, если он уже был показан и ничего не занято."""
+        busy = (self.preview_thread and self.preview_thread.isRunning()) or \
+               (self.processing_thread and self.processing_thread.isRunning())
+        if self.last_preview_image and not busy:
+            self.on_update_preview()
+
+    def open_preview_large(self):
+        if self.last_preview_image and os.path.exists(self.last_preview_image):
+            ImageViewerDialog(self.last_preview_image, self).exec_()
+
     def on_preview_finished(self, image_path):
         if os.path.exists(image_path):
+            self.last_preview_image = image_path
             pixmap = QPixmap(image_path)
             self.preview_label.setPixmap(
                 pixmap.scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
@@ -1448,38 +1481,6 @@ class ProcessingWidgetContent(QWidget):
         # обрабатываться, сводка будет в конце.
         self.status_label.setText(msg.splitlines()[0] if msg else "Ошибка")
 
-    def on_subtitle_preview(self):
-        selected_items = self.video_list_widget.selectedItems()
-        if not selected_items:
-            QMessageBox.warning(self, "Нет видео", "Выберите видео для предпросмотра субтитров")
-            return
-
-        video_path = selected_items[0].data(Qt.UserRole)
-
-        srt_path = None
-        if self.subs_from_file_radio.isChecked():
-            srt_path = self.subs_srt_path.text()
-            if not srt_path or not os.path.exists(srt_path):
-                QMessageBox.warning(self, "Нет SRT", "Укажите корректный файл субтитров .srt")
-                return
-
-        if not srt_path:
-            QMessageBox.warning(self, "Режим не поддерживается",
-                              "Предпросмотр доступен только для режима 'Из файла SRT'.\n"
-                              "Сначала сгенерируйте субтитры или укажите готовый .srt файл.")
-            return
-
-        current = self.subtitle_style()
-        dialog = SubtitlePreviewDialog(video_path, srt_path, self, initial_style={
-            'size': current['font_size'], 'color': current['color'],
-            'outline_color': current['outline_color']})
-        if dialog.exec_() == QDialog.Accepted:
-            style = dialog.get_style()
-            self.subs_size_spin.setValue(style.get('size', 12))
-            self.subs_color_btn.set_color(style.get('color', '#FFFFFF'))
-            self.subs_outline_btn.set_color(style.get('outline_color', '#000000'))
-            self.save_subtitle_settings()
-
 
 class VideoUnicApp(QMainWindow):
     def __init__(self):
@@ -1600,7 +1601,12 @@ class VideoUnicApp(QMainWindow):
                     proc_thread.wait(5000)
                 except Exception as e:
                     print(f"Error stopping worker thread: {e}")
-            self.processing_widget.player_panel.shutdown()
+            content = self.processing_widget
+            content.preview_refresh_timer.stop()
+            for thread in (content.preview_thread, content.codec_probe):
+                if thread is not None and thread.isRunning():
+                    thread.wait(10000)
+            content.player_panel.shutdown()
             self._cleanup_temp_files()
             event.accept()
         else:

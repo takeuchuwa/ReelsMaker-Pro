@@ -366,6 +366,9 @@ class PlayerPanel(QWidget):
         self.start = 0.0
         self.end = None
         self.thumb_loader = None
+        # Остановленные загрузчики дорабатывают текущую миниатюру: держим их,
+        # пока не выйдут, иначе Qt уничтожит работающий поток.
+        self._retired_loaders = []
         self.view = None
         self._build()
         self._set_enabled(False)
@@ -543,11 +546,15 @@ class PlayerPanel(QWidget):
 
     def _stop_thumbnails(self):
         if self.thumb_loader is not None:
-            self.thumb_loader.stop()
+            loader = self.thumb_loader
+            loader.stop()
             try:
-                self.thumb_loader.thumbnail.disconnect()
+                loader.thumbnail.disconnect()
             except TypeError:
                 pass
+            self._retired_loaders.append(loader)
+            loader.finished.connect(lambda: self._retired_loaders.remove(loader)
+                                    if loader in self._retired_loaders else None)
             self.thumb_loader = None
 
     def current_time(self) -> Optional[float]:
@@ -557,6 +564,8 @@ class PlayerPanel(QWidget):
 
     def shutdown(self):
         self._stop_thumbnails()
+        for loader in list(self._retired_loaders):
+            loader.wait(5000)
         if self.view is not None:
             self.view.shutdown()
 
