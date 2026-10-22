@@ -6,9 +6,10 @@ Whisper ошибается в именах и терминах; автозаме
 import os
 
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (QAbstractItemView, QDialog, QHBoxLayout, QHeaderView, QLabel,
                              QListWidget, QMessageBox, QPushButton, QSplitter, QTableWidget,
-                             QTableWidgetItem, QVBoxLayout, QWidget, QApplication)
+                             QTableWidgetItem, QVBoxLayout, QWidget, QApplication, QShortcut)
 
 from utils.captions import edit_line_text, retime_line
 from utils.timecode import format_timecode, parse_timecode
@@ -17,10 +18,14 @@ COL_START, COL_END, COL_TEXT = range(3)
 
 
 class SubtitleReviewDialog(QDialog):
-    def __init__(self, captions, play_callback=None, parent=None):
+    def __init__(self, captions, play_callback=None, parent=None, player=None):
         super().__init__(parent)
         self.setWindowTitle("Проверка субтитров")
         self.play_callback = play_callback
+        self.player = player
+        # Пока идёт прослушивание, выделение в таблице следует за звуком.
+        self._following = False
+        self._play_end = None
         # Своя копия: «Отменить» не должно оставлять полуправленные строки.
         self.captions = {path: [list(line) for line in lines] for path, lines in captions.items()}
         self.paths = list(self.captions)
@@ -71,6 +76,18 @@ class SubtitleReviewDialog(QDialog):
         self.play_btn.setToolTip("Проиграть строку в плеере главного окна")
         self.play_btn.clicked.connect(self._play)
         self.play_btn.setEnabled(self.play_callback is not None)
+        self.play_all_btn = QPushButton("▶▶ Прослушать всё")
+        self.play_all_btn.setToolTip("Без остановки с выделенной строки до конца")
+        self.play_all_btn.clicked.connect(self._play_all)
+        self.play_all_btn.setEnabled(self.play_callback is not None)
+        self.pause_btn = QPushButton("⏸ Пауза")
+        self.pause_btn.setToolTip("Пауза / продолжить  Ctrl+Пробел")
+        self.pause_btn.clicked.connect(self._toggle_pause)
+        self.pause_btn.setEnabled(False)
+        QShortcut(QKeySequence("Ctrl+Space"), self, activated=self._toggle_pause)
+        if self.player is not None:
+            self.player.position_changed.connect(self._on_position)
+            self.player.playing_changed.connect(self._on_playing)
         merge_btn = QPushButton("Склеить со следующей")
         merge_btn.clicked.connect(self._merge)
         delete_btn = QPushButton("Удалить строку")
@@ -78,6 +95,8 @@ class SubtitleReviewDialog(QDialog):
         self.count_label = QLabel()
         self.count_label.setObjectName("status_label")
         tools.addWidget(self.play_btn)
+        tools.addWidget(self.play_all_btn)
+        tools.addWidget(self.pause_btn)
         tools.addWidget(merge_btn)
         tools.addWidget(delete_btn)
         tools.addStretch()
@@ -109,6 +128,10 @@ class SubtitleReviewDialog(QDialog):
 
     def _on_file(self, row):
         if 0 <= row < len(self.paths):
+            if self._following and self.player is not None:
+                self.player.set_paused(True)
+            self._following = False
+            self.pause_btn.setEnabled(False)
             self.path = self.paths[row]
             self._fill()
 
@@ -159,7 +182,59 @@ class SubtitleReviewDialog(QDialog):
         if row is None or not self.play_callback:
             return
         line = self._lines()[row]
-        self.play_callback(self.path, line[0].start, line[-1].end)
+        self._start_playback(line[0].start, line[-1].end)
+
+    def _play_all(self):
+        lines = [l for l in self._lines() if l]
+        if not lines or not self.play_callback:
+            return
+        row = self._current_row() or 0
+        start = lines[min(row, len(lines) - 1)][0].start
+        self._start_playback(start, max(l[-1].end for l in lines))
+
+    def _start_playback(self, start, end):
+        self._following = True
+        self._play_end = end
+        self.pause_btn.setEnabled(True)
+        self.play_callback(self.path, start, end)
+
+    def _toggle_pause(self):
+        if self.player is None or not self._following:
+            return
+        self.player.set_paused(self.player.is_playing())
+
+    def _on_playing(self, playing):
+        self.pause_btn.setText("⏸ Пауза" if playing else "▶ Продолжить")
+
+    def _on_position(self, t):
+        if not self._following:
+            return
+        if self._play_end is not None and t >= self._play_end - 0.05:
+            # Доиграли до конца: «Продолжить» дальше вело бы за пределы.
+            self._following = False
+            self.pause_btn.setEnabled(False)
+            self.pause_btn.setText("⏸ Пауза")
+            return
+        # Пока человек печатает в ячейке, выделение не трогаем: иначе правка
+        # прерывалась бы на полуслове.
+        if self.table.state() == QAbstractItemView.EditingState:
+            return
+        lines = self._lines()
+        row = next((i for i, l in enumerate(lines) if l and l[0].start <= t < l[-1].end + 0.3), None)
+        if row is not None and row != self._current_row():
+            self.table.selectRow(row)
+            self.table.scrollToItem(self.table.item(row, COL_TEXT))
+
+    def done(self, result):
+        # Рендер начнётся сразу: звук из плеера в это время только мешал бы.
+        if self.player is not None:
+            self.player.set_paused(True)
+            try:
+                self.player.position_changed.disconnect(self._on_position)
+                self.player.playing_changed.disconnect(self._on_playing)
+            except TypeError:
+                pass
+        super().done(result)
 
     def _merge(self):
         row = self._current_row()

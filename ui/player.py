@@ -358,6 +358,9 @@ class PlayerPanel(QWidget):
     """Плеер, таймлайн и поля тайм-кодов для текущего видео в списке."""
     trim_changed = pyqtSignal(str, float, object)   # путь, начало, конец/None
     apply_to_all = pyqtSignal(float, object)
+    # Для окна проверки субтитров: где сейчас воспроизведение и идёт ли оно.
+    position_changed = pyqtSignal(float)
+    playing_changed = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -581,6 +584,14 @@ class PlayerPanel(QWidget):
         except Exception as error:
             logger.warning(f"seek failed: {error}")
 
+    def is_playing(self):
+        return self.view is not None and self.path is not None and not self.view.player.pause
+
+    def set_paused(self, paused):
+        """Пауза без сброса конца отрезка: «продолжить» доиграет до него."""
+        if self.view is not None and self.path is not None:
+            self.view.player.pause = paused
+
     def play_segment(self, start, end, attempts=20):
         """Проиграть отрезок и встать на паузу в его конце. Файл мог только
         начать загружаться — тогда поиск не удастся, пробуем чуть позже."""
@@ -656,6 +667,7 @@ class PlayerPanel(QWidget):
         if self._segment_end is not None and t >= self._segment_end:
             self._segment_end = None
             self.view.player.pause = True
+        self.position_changed.emit(t)
         self.timeline.set_position(t)
         self._update_time_label(t)
 
@@ -669,6 +681,7 @@ class PlayerPanel(QWidget):
             self._update_time_label(self.timeline.position)
 
     def _on_pause(self, paused):
+        self.playing_changed.emit(not paused)
         self.btn_play.setIcon(qta.icon('fa5s.play' if paused else 'fa5s.pause', color='#c8ccd2'))
 
     def _update_time_label(self, t):

@@ -1492,7 +1492,7 @@ class ProcessingWidgetContent(QWidget):
         thread = self.processing_thread
         if thread is None:
             return
-        dialog = SubtitleReviewDialog(captions, self.play_caption, self)
+        dialog = SubtitleReviewDialog(captions, self.play_caption, self, player=self.player_panel)
         accepted = dialog.exec_() == QDialog.Accepted
         thread.resume(dialog.result_captions() if accepted else None)
         if accepted:
